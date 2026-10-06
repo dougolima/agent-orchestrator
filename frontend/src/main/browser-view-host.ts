@@ -593,6 +593,17 @@ export function scaleBoundsForZoom(rect: BrowserRect, zoomFactor: number): Brows
 
 export function createBrowserViewHost(options: BrowserViewHostOptions): BrowserViewHost {
 	const entries = new Map<string, BrowserSessionEntry>();
+	// Workers whose human explicitly picked the temporary profile this run.
+	const explicitTemporarySessionIds = new Set<string>();
+	// A worker without a durable binding starts in the first configured profile;
+	// temporary is used only when no profile exists or the human picked it.
+	const initialProfileIdForSession = (sessionId: string): BrowserProfileId | null => {
+		const store = options.browserProfileStore;
+		if (!store || explicitTemporarySessionIds.has(sessionId)) return null;
+		const boundProfileId = store.getSessionProfileId(sessionId);
+		if (boundProfileId && store.getProfile(boundProfileId)) return boundProfileId;
+		return store.profiles[0]?.id ?? null;
+	};
 	const historyFaviconCache = new WeakMap<Session, Map<string, Promise<string | undefined>>>();
 	const signalWatchers = new Map<
 		BrowserElectronSession,
@@ -856,9 +867,7 @@ export function createBrowserViewHost(options: BrowserViewHostOptions): BrowserV
 		const viewId = existingViewId ?? `${rendererId ?? 0}:${sessionId}`;
 		let session = entries.get(viewId);
 		if (!session) {
-			const boundProfileId = options.browserProfileStore?.getSessionProfileId(sessionId);
-			const boundProfile = boundProfileId ? options.browserProfileStore?.getProfile(boundProfileId) : undefined;
-			const profileId = boundProfile ? boundProfile.id : null;
+			const profileId = initialProfileIdForSession(sessionId);
 			session = {
 				sessionId,
 				viewId,
@@ -921,9 +930,9 @@ export function createBrowserViewHost(options: BrowserViewHostOptions): BrowserV
 		const store = options.browserProfileStore;
 		if (store) {
 			for (;;) {
-				const boundProfileId = store.getSessionProfileId(sessionId);
-				if (!boundProfileId || !store.isProfileOperationInProgress(boundProfileId)) break;
-				await store.waitForProfileOperation(boundProfileId);
+				const profileId = initialProfileIdForSession(sessionId);
+				if (!profileId || !store.isProfileOperationInProgress(profileId)) break;
+				await store.waitForProfileOperation(profileId);
 			}
 		}
 		if (isUnavailable?.()) {
@@ -1823,6 +1832,8 @@ export function createBrowserViewHost(options: BrowserViewHostOptions): BrowserV
 			await options.agentBrowserRuntime?.closeSession(session.sessionId);
 			assertCurrentSession();
 			await store.bindSession(session.sessionId, normalizedRequestedProfileId);
+			if (normalizedRequestedProfileId === null) explicitTemporarySessionIds.add(session.sessionId);
+			else explicitTemporarySessionIds.delete(session.sessionId);
 			bindingChanged = true;
 			assertCurrentSession();
 
@@ -1845,6 +1856,8 @@ export function createBrowserViewHost(options: BrowserViewHostOptions): BrowserV
 			if (bindingChanged) {
 				try {
 					await store.bindSession(session.sessionId, previousProfileId);
+					if (previousProfileId === null) explicitTemporarySessionIds.add(session.sessionId);
+					else explicitTemporarySessionIds.delete(session.sessionId);
 				} catch (rollbackError) {
 					console.error("browser profile binding rollback failed:", rollbackError);
 				}

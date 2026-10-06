@@ -1015,9 +1015,15 @@ function setupTabHost(
 	};
 }
 
-function fakeBrowserProfileStore(profile: BrowserProfile, bindings: Record<string, string>): BrowserProfileStore {
+function fakeBrowserProfileStore(
+	profile: BrowserProfile,
+	bindings: Record<string, string>,
+	listed = true,
+): BrowserProfileStore {
 	return {
-		profiles: [profile],
+		// `listed: false` models a store with no configured profile, so an unbound
+		// worker has nothing to default to and starts in Temporary.
+		profiles: listed ? [profile] : [],
 		getProfile: (profileId: string) => (profileId === profile.id ? { ...profile } : undefined),
 		getSessionProfileId: (sessionId: string) => bindings[sessionId],
 		bindSession: vi.fn(async (sessionId: string, profileId: string | null) => {
@@ -1941,9 +1947,50 @@ describe("browser profile partitions and replacement", () => {
 		expect(third.host.isProfileLive(profile.id)).toBe(false);
 	});
 
+	it("starts an unbound worker in the first configured profile", async () => {
+		const store = fakeBrowserProfileStore(profile, {});
+		const { constructorOptions, host, invoke } = setupTabHost(store);
+
+		const nav = (await invoke("browser:ensure", "worker-1")) as BrowserNavState;
+
+		expect(host.getProfileState(nav.viewId)).toMatchObject({ profileId: profile.id, temporary: false });
+		expect(constructorOptions[0]!.webPreferences.partition).toBe(browserProfilePartition(profile.id));
+	});
+
+	it("falls back to the first configured profile when the bound profile no longer exists", async () => {
+		const store = fakeBrowserProfileStore(profile, { "worker-1": "99999999-9999-4999-8999-999999999999" });
+		const { host, invoke } = setupTabHost(store);
+
+		const nav = (await invoke("browser:ensure", "worker-1")) as BrowserNavState;
+
+		expect(host.getProfileState(nav.viewId)).toMatchObject({ profileId: profile.id, temporary: false });
+	});
+
+	it("starts an unbound worker in Temporary when no profile is configured", async () => {
+		const store = fakeBrowserProfileStore(profile, {}, false);
+		const { host, invoke } = setupTabHost(store);
+
+		const nav = (await invoke("browser:ensure", "worker-1")) as BrowserNavState;
+
+		expect(host.getProfileState(nav.viewId)).toMatchObject({ profileId: null, temporary: true });
+	});
+
+	it("keeps a worker on Temporary after the human picks it explicitly", async () => {
+		const store = fakeBrowserProfileStore(profile, {});
+		const { host, invoke } = setupTabHost(store);
+		const nav = (await invoke("browser:ensure", "worker-1")) as BrowserNavState;
+
+		await host.switchProfile(nav.viewId, null);
+		expect(host.getProfileState(nav.viewId)).toMatchObject({ profileId: null, temporary: true });
+
+		host.destroy(nav.viewId);
+		const again = (await invoke("browser:ensure", "worker-1")) as BrowserNavState;
+		expect(host.getProfileState(again.viewId)).toMatchObject({ profileId: null, temporary: true });
+	});
+
 	it("clears an old temporary partition only after a switch to a profile succeeds", async () => {
 		const bindings: Record<string, string> = {};
-		const store = fakeBrowserProfileStore(profile, bindings);
+		const store = fakeBrowserProfileStore(profile, bindings, false);
 		const clearBrowserProfileData = vi.fn(async (_partition: string) => undefined);
 		const { constructorOptions, host, invoke } = setupTabHost(
 			store,
@@ -1965,7 +2012,7 @@ describe("browser profile partitions and replacement", () => {
 
 	it("does not clear a temporary partition when a failed profile switch rolls back to it", async () => {
 		const bindings: Record<string, string> = {};
-		const store = fakeBrowserProfileStore(profile, bindings);
+		const store = fakeBrowserProfileStore(profile, bindings, false);
 		const clearBrowserProfileData = vi.fn(async (_partition: string) => undefined);
 		let failReplacementStartup = true;
 		const { constructorOptions, host, invoke } = setupTabHost(
