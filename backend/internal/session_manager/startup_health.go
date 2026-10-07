@@ -45,7 +45,7 @@ func (m *Manager) checkSessionHealth(ctx context.Context, rec domain.SessionReco
 	}
 	handle := runtimeHandle(rec.Metadata)
 	if handle.ID == "" {
-		return m.recordAgentExited(ctx, rec)
+		return m.recordTUIExitedForRecovery(ctx, rec)
 	}
 	alive, err := m.runtime.IsAlive(ctx, handle)
 	if err != nil {
@@ -54,5 +54,13 @@ func (m *Manager) checkSessionHealth(ctx context.Context, rec domain.SessionReco
 	if alive {
 		return nil
 	}
+	return m.recordTUIExitedForRecovery(ctx, rec)
+}
+
+// recordTUIExitedForRecovery records a dead TUI runtime as exited and holds the
+// session first, so the runtime reaper's tick right after boot recovery cannot
+// terminate a session that opening it should resume.
+func (m *Manager) recordTUIExitedForRecovery(ctx context.Context, rec domain.SessionRecord) error {
+	m.lcm.HoldExitedForRecovery(rec.ID, rec.Metadata.RuntimeLaunchID)
 	return m.recordAgentExited(ctx, rec)
 }

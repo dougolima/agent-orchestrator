@@ -276,6 +276,10 @@ type Manager struct {
 	// This coordination is intentionally memory-only: a daemon crash leaves the
 	// durable session exited, so the user can safely retry the resume.
 	pendingLaunches map[domain.SessionID]pendingLaunch
+	// heldForRecovery maps a session that boot reconciliation preserved after a
+	// failed relaunch to the runtime launch it already knows is dead. Guarded by
+	// mu. Memory-only: every boot reruns reconciliation and re-establishes it.
+	heldForRecovery map[domain.SessionID]string
 	// steerActive reports whether a harness can safely receive a write during an
 	// active turn (input steers the run) rather than only while idle. Supplied by
 	// the agent adapter via WithActiveSteering; the default answers false, so an
@@ -305,6 +309,7 @@ func New(store sessionStore, messenger ports.AgentMessenger, opts ...Option) *Ma
 		flights:                     map[domain.SessionID]*toolFlight{},
 		steps:                       map[domain.SessionID][]domain.SessionStep{},
 		pendingLaunches:             map[domain.SessionID]pendingLaunch{},
+		heldForRecovery:             map[domain.SessionID]string{},
 		steerActive:                 func(domain.AgentHarness) bool { return false },
 		startupSignalGatesInput:     func(domain.AgentHarness) bool { return false },
 		urgentNudgeWaitingInputSafe: func(domain.AgentHarness) bool { return false },
@@ -484,6 +489,9 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 			delete(m.flights, id)
 			return next, true
 		}
+		if m.heldForRecoveryLocked(id, cur) {
+			return cur, false
+		}
 		if !runtimeClearlyDead(f, cur.Activity, now, m.window) {
 			return cur, false
 		}
@@ -503,7 +511,7 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 
 	terminated := false
 	err := m.mutate(ctx, id, func(cur domain.SessionRecord, now time.Time) (domain.SessionRecord, bool) {
-		if cur.IsTerminated || cur.Revision != terminationRevision ||
+		if cur.IsTerminated || cur.Revision != terminationRevision || m.heldForRecoveryLocked(id, cur) ||
 			cur.Metadata.RuntimeLaunchID != terminationLaunch || !matchesLaunch(cur) ||
 			!runtimeClearlyDead(f, cur.Activity, now, m.window) || m.sessionMutationInProgress(id) {
 			return cur, false
@@ -532,6 +540,32 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 		m.reapSessionContainers(ctx, id)
 	}
 	return nil
+}
+
+// HoldExitedForRecovery keeps a session that boot reconciliation preserved
+// after a failed relaunch from being terminated by the runtime launch it already
+// knows is dead. Resume Agent refuses terminated sessions, so without the hold
+// the reaper's next tick would close the recovery path reconciliation kept open.
+// The hold ends when the session launches again under a new launch id.
+func (m *Manager) HoldExitedForRecovery(id domain.SessionID, launchID string) {
+	m.mu.Lock()
+	m.heldForRecovery[id] = launchID
+	m.mu.Unlock()
+}
+
+// heldForRecoveryLocked reports whether cur is still the exited launch that
+// HoldExitedForRecovery protected, dropping a hold a newer launch has outlived.
+// Callers hold m.mu.
+func (m *Manager) heldForRecoveryLocked(id domain.SessionID, cur domain.SessionRecord) bool {
+	launchID, ok := m.heldForRecovery[id]
+	if !ok {
+		return false
+	}
+	if launchID != cur.Metadata.RuntimeLaunchID {
+		delete(m.heldForRecovery, id)
+		return false
+	}
+	return cur.Activity.State == domain.ActivityExited
 }
 
 // A concurrent session writer can advance updated_at between lifecycle's read
@@ -927,7 +961,7 @@ retryProjection:
 		checkpointChanged || subagentFacts != storedSubagentFacts
 	toolFlightBeforeProjection := cloneToolFlight(m.flights[id])
 	if s.Valid {
-		s = m.applyToolPrecedenceLocked(id, rec.Activity.State, s)
+		s = m.applyToolPrecedenceLocked(id, rec.Harness, rec.Activity.State, s)
 	}
 	if !s.Valid && !metadataChanged {
 		m.mu.Unlock()
@@ -1269,6 +1303,25 @@ func isTurnBoundaryEvent(event string) bool {
 		event == "process-exited" || event == "chat.controller.stopped" || event == "permission-resolved"
 }
 
+// claudeHookFamily reports harnesses whose CLIs speak Claude Code's hook
+// contract, including its ~60s client-side idle Notification(agent_needs_input)
+// that fires even when the finished turn asked no question (#3738). Grok
+// routes its Notification hook through the claudecode deriver
+// (activitydispatch), so it shares the same phantom-timer exposure; continue
+// wraps the claude CLI and kimchi mirrors its semantics. The suppression
+// scoped to this family must not leak to harnesses whose
+// notification → waiting_input is genuine: aider's completion notification is
+// its ONLY activity signal, and droid deliberately upgrades its post-Stop
+// idle Notification to sticky waiting_input to suppress nudges.
+func claudeHookFamily(harness domain.AgentHarness) bool {
+	switch harness {
+	case domain.HarnessClaudeCode, domain.HarnessGrok, domain.HarnessContinue, domain.HarnessKimchi:
+		return true
+	default:
+		return false
+	}
+}
+
 // applyToolPrecedenceLocked folds an event-tagged activity signal through the
 // session's tool-flight state and decides whether its state write may
 // proceed. Returned signal with Valid=false means "suppressed": the tracking
@@ -1276,7 +1329,7 @@ func isTurnBoundaryEvent(event string) bool {
 // Event pass through untouched — the compatibility contract for old CLIs and
 // for adapters that don't tag their signals (their last-writer-wins semantics
 // are pinned by tests). Caller must hold m.mu.
-func (m *Manager) applyToolPrecedenceLocked(id domain.SessionID, cur domain.ActivityState, s ports.ActivitySignal) ports.ActivitySignal {
+func (m *Manager) applyToolPrecedenceLocked(id domain.SessionID, harness domain.AgentHarness, cur domain.ActivityState, s ports.ActivitySignal) ports.ActivitySignal {
 	if s.Event == "" {
 		return s
 	}
@@ -1405,6 +1458,19 @@ func (m *Manager) applyToolPrecedenceLocked(id domain.SessionID, cur domain.Acti
 	case cur.IsSticky() && isToolUseEvent(s.Event):
 		// waiting_input: background tool traffic must not clear the "waiting
 		// on the user" marker; only an explicit user/turn signal does.
+		return suppressed
+	case cur == domain.ActivityIdle && claudeHookFamily(harness) &&
+		s.Event == "notification" && s.State == domain.ActivityWaitingInput:
+		// Claude Code fires Notification(agent_needs_input) on a ~60s
+		// client-side idle timer even when the finished turn asked no question
+		// (#3738). While the durable state is idle, AO has already observed
+		// the turn's Stop and no user-prompt-submit has followed, so no turn
+		// is in flight and no question can be pending: the notification is a
+		// timer artifact contradicting AO's own record, not a question. It
+		// must not promote a known-idle session into sticky waiting_input,
+		// which suppresses automated delivery until a human intervenes. A
+		// genuine agent_needs_input arrives mid-turn (cur active) and still
+		// lands; re-assertions over waiting_input are same-state no-ops.
 		return suppressed
 
 	default:

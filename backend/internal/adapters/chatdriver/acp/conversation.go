@@ -130,12 +130,21 @@ type conversation struct {
 	onAuthRejected        func()
 	promptResponseFailure func(acpsdk.PromptResponse) error
 
+	// reattachRequest re-binds sessionID with session/resume when the agent
+	// process stays connected but has forgotten the session, as claude-agent-acp
+	// does after its Claude child dies. Nil when the agent cannot resume.
+	reattachRequest *acpsdk.ResumeSessionRequest
+
 	contextTokens     int64
 	contextWindow     int64
 	compactingTurnID  string
 	compactionBefore  int64
 	compactionSummary string
 	compactedTurn     string
+
+	// updateFlow keeps a burst of session/update notifications, such as a
+	// persistent host's reconnect replay, from overflowing the SDK's queue.
+	updateFlow *sessionUpdateFlow
 
 	eventMu      sync.RWMutex
 	events       chan ports.ChatEvent
@@ -197,11 +206,13 @@ func newConversation(
 		events:           make(chan ports.ChatEvent, eventBuffer),
 		extensionFor:     extensionFor,
 		extensionMethods: reverseAliases,
+		updateFlow:       newSessionUpdateFlow(maxPendingSessionUpdates),
 	}
 	legacyWire, sdkWriter, sdkReader := newLegacyACPTransport(proc.stdin, proc.stdout)
 	c.legacyWire = legacyWire
 	c.conn = acpsdk.NewClientSideConnection(
-		c, sdkWriter, newExtensionMethodReader(sdkReader, extensionAliases),
+		c, sdkWriter,
+		newSessionUpdateFlowReader(newExtensionMethodReader(sdkReader, extensionAliases), c.updateFlow),
 	)
 	c.conn.SetLogger(log)
 	go c.watchConnection()
@@ -397,7 +408,11 @@ func (c *conversation) SendTurn(ctx context.Context, msg ports.ChatUserMessage) 
 	if busy {
 		return ports.ChatTurnRef{}, errors.New("ACP conversation already has a turn in flight")
 	}
-	if err := c.applyTurnSettings(ctx, msg.Settings); err != nil {
+	err = c.applyTurnSettings(ctx, msg.Settings)
+	if isACPSessionNotFound(err) && c.reattachSession(ctx, err) {
+		err = c.applyTurnSettings(ctx, msg.Settings)
+	}
+	if err != nil {
 		return ports.ChatTurnRef{}, err
 	}
 	c.mu.Lock()
@@ -419,6 +434,33 @@ func (c *conversation) DiscardDeferredTurn(providerTurnID string) {
 		c.prepared = nil
 	}
 	c.mu.Unlock()
+}
+
+// reattachSession asks the agent to resume AO's stored session id on the live
+// connection after the agent reported it unknown. Nothing has been prompted yet,
+// so retrying the turn's settings afterwards cannot run any work twice. The
+// provider keeps its transcript on disk, so the conversation's context survives.
+func (c *conversation) reattachSession(ctx context.Context, cause error) bool {
+	c.mu.Lock()
+	request := c.reattachRequest
+	c.mu.Unlock()
+	if request == nil {
+		return false
+	}
+	sessionID := string(request.SessionId)
+	c.log.Warn("chat: ACP agent lost its session; reattaching",
+		"providerSessionID", sessionID, "error", cause)
+	resumeCtx, cancel := context.WithTimeout(ctx, handshakeTimeout)
+	defer cancel()
+	resp, err := c.conn.ResumeSession(resumeCtx, *request)
+	if err != nil {
+		c.log.Warn("chat: ACP session reattach failed", "providerSessionID", sessionID, "error", err)
+		return false
+	}
+	if len(resp.ConfigOptions) > 0 {
+		c.replaceConfigOptions(resp.ConfigOptions)
+	}
+	return true
 }
 
 func (c *conversation) applyTurnSettings(ctx context.Context, settings ports.ChatTurnSettings) error {
@@ -584,11 +626,18 @@ func (c *conversation) runTurn(ctx context.Context, sessionID string, turn prepa
 	if messageID == "" {
 		messageID = uuid.NewString()
 	}
-	resp, err := c.conn.Prompt(ctx, acpsdk.PromptRequest{
+	request := acpsdk.PromptRequest{
 		SessionId: acpsdk.SessionId(sessionID),
 		MessageId: &messageID,
 		Prompt:    turn.prompt,
-	})
+	}
+	resp, err := c.conn.Prompt(ctx, request)
+	// A turn with no settings to apply reaches the agent here first. An agent
+	// that no longer knows the session rejected the prompt without running it,
+	// so reattaching and resending it once cannot run the turn twice.
+	if isACPSessionNotFound(err) && c.reattachSession(ctx, err) {
+		resp, err = c.conn.Prompt(ctx, request)
+	}
 
 	c.finishPrompt(turn.id, resp, err)
 }
@@ -1001,6 +1050,13 @@ func (c *conversation) AcknowledgeProviderEvent(ctx context.Context, providerEve
 
 func (c *conversation) watchConnection() {
 	<-c.conn.Done()
+	c.updateFlow.close()
+	// Once the SDK stops reading, a persistent host keeps writing into a socket
+	// nobody drains and blocks every later attach. Detach without consuming
+	// closeOnce, so a later Terminate can still shut the host down.
+	if c.proc != nil && c.proc.terminate != nil && c.proc.stop != nil {
+		_ = c.proc.stop()
+	}
 	c.mu.Lock()
 	detaching := c.detaching
 	c.mu.Unlock()
