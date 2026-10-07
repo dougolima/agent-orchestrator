@@ -974,6 +974,50 @@ export function LiveResponseStatus({ startedAt, settling = false, startupLabel, 
 	);
 }
 
+/** How long a live turn stays quiet before its live edge says the agent is thinking. */
+const THINKING_AFTER_MS = 5_000;
+
+/**
+ * The live edge of a turn that has gone quiet.
+ *
+ * The Working row sits under the prompt, so once a turn has a few steps the newest
+ * finished row is the last thing on screen, and an agent thinking between two calls
+ * looks idle: recent Claude models stream no reasoning, so a long think produces no
+ * event at all. It waits out a short quiet stretch first, so a quick run of steps
+ * or a reply still streaming never flickers it.
+ *
+ * `quietSince` is when this client last saw the turn change. The duration is shown
+ * only when that change was observed here: after a remount the start of the quiet
+ * stretch is unknown, and a guessed duration would mislead exactly the reader who
+ * is checking whether the agent is stuck.
+ */
+export function LiveThinkingStatus({ quietSince, observed }: { quietSince: number; observed: boolean }) {
+	const reducedMotion = useReducedMotion();
+	const [now, setNow] = useState(() => Date.now());
+	useEffect(() => {
+		const timer = window.setInterval(() => setNow(Date.now()), 1000);
+		return () => window.clearInterval(timer);
+	}, []);
+	const quietMs = now - quietSince;
+	if (quietMs < THINKING_AFTER_MS) return null;
+	return (
+		<motion.div
+			initial={reducedMotion ? false : { opacity: 0 }}
+			animate={{ opacity: 1 }}
+			transition={{ duration: reducedMotion ? 0 : 0.15, ease: "easeOut" }}
+			data-testid="live-thinking-status"
+			className="flex select-none items-center gap-1.5 py-0.5 text-[11.5px] text-muted-foreground"
+		>
+			<ResponseSpinner />
+			<span className="tabular-nums">
+				{/* Announced once; a count read aloud every second would drown the reader. */}
+				<span role="status">Thinking</span>
+				{observed ? <span aria-hidden="true"> for {formatDuration(quietMs)}</span> : null}
+			</span>
+		</motion.div>
+	);
+}
+
 /**
  * Delivery state, stated rather than implied. `uncertain` is its own outcome:
  * the provider may have accepted the turn while AO lost the connection, and

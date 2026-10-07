@@ -15,7 +15,7 @@ import {
 	chatFixtureThreadError,
 } from "../../lib/chat-fixture";
 import { appI18n } from "../../i18n";
-import type { ConversationMessage, ConversationSnapshot } from "../../types/conversation";
+import type { ConversationActivity, ConversationMessage, ConversationSnapshot } from "../../types/conversation";
 import { setApiBaseUrl } from "../../lib/api-client";
 import { useUiStore } from "../../stores/ui-store";
 import type { WorkspaceSession } from "../../types/workspace";
@@ -860,6 +860,73 @@ describe("ChatWorkspace timeline", () => {
 
 		expect(screen.getByTestId("live-working-label")).toHaveTextContent(/^Working for /);
 		expect(screen.getByTestId("response-spinner")).toBeInTheDocument();
+	});
+
+	describe("live edge of a quiet turn", () => {
+		const turnId = "turn-quiet";
+		const at = "2026-08-11T10:01:00Z";
+		const prompt: ConversationMessage = {
+			kind: "message", id: "prompt", turnId, sequence: 1, revision: 0,
+			role: "user", origin: "human", text: "Draft the page", streaming: false, createdAt: at,
+		};
+		const read: ConversationActivity = {
+			kind: "activity", id: "read", turnId, sequence: 2, revision: 1,
+			activityKind: "command", status: "completed", summary: "cat notes.md",
+			detail: { command: "cat notes.md" }, createdAt: at,
+		};
+		const quietSnapshot = (items: ConversationSnapshot["items"]): ConversationSnapshot => ({
+			...chatFixtureEmpty,
+			controller: { state: "busy" },
+			latestSequence: items.length,
+			turns: [{ id: turnId, state: "running", requestedAt: at, startedAt: at }],
+			items,
+		});
+
+		afterEach(() => {
+			vi.useRealTimers();
+		});
+
+		it("says the agent is thinking once the turn goes quiet, timing only a stretch it saw start", () => {
+			vi.useFakeTimers();
+			const view = render(<ChatWorkspace snapshot={quietSnapshot([prompt, read])} />);
+			expect(screen.queryByTestId("live-thinking-status")).not.toBeInTheDocument();
+
+			act(() => vi.advanceTimersByTime(5_000));
+			// Mounted mid-silence: when it began is unknown, so no duration is claimed.
+			expect(screen.getByTestId("live-thinking-status")).toHaveTextContent(/^Thinking$/);
+
+			// A new step restarts the wait, and this time the client saw the step land.
+			view.rerender(
+				<ChatWorkspace snapshot={quietSnapshot([prompt, read, { ...read, id: "read-2", sequence: 3 }])} />,
+			);
+			expect(screen.queryByTestId("live-thinking-status")).not.toBeInTheDocument();
+			act(() => vi.advanceTimersByTime(6_000));
+			expect(screen.getByTestId("live-thinking-status")).toHaveTextContent(/^Thinking for 6s$/);
+		});
+
+		it("leaves the live edge to a running call's own spinner and to a pending decision", () => {
+			vi.useFakeTimers();
+			const view = render(
+				<ChatWorkspace snapshot={quietSnapshot([prompt, { ...read, status: "running" }])} />,
+			);
+			act(() => vi.advanceTimersByTime(30_000));
+			expect(screen.queryByTestId("live-thinking-status")).not.toBeInTheDocument();
+
+			view.rerender(
+				<ChatWorkspace
+					snapshot={quietSnapshot([
+						prompt,
+						read,
+						{
+							...read, id: "approval", sequence: 3, activityKind: "approval", status: "pending",
+							summary: "Run deploy", requestId: "request-1",
+						},
+					])}
+				/>,
+			);
+			act(() => vi.advanceTimersByTime(30_000));
+			expect(screen.queryByTestId("live-thinking-status")).not.toBeInTheDocument();
+		});
 	});
 
 	it("keeps single-item settled work inside the Worked accordion", async () => {

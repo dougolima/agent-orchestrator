@@ -111,6 +111,7 @@ import {
 	TurnDuration,
 	TurnOutcome,
 	LiveResponseStatus,
+	LiveThinkingStatus,
 	type TurnOutcomeRetryControl,
 } from "./ChatTimelineItems";
 import { HumanMessageEditor } from "./HumanMessageEditor";
@@ -3656,6 +3657,17 @@ const TurnGroup = memo(function TurnGroup({
 		const timer = window.setTimeout(() => setShowSettledStatus(true), 440);
 		return () => window.clearTimeout(timer);
 	}, [group.live]);
+	const quiet = useQuietSince(group.live ? turnProgressKey(group.items) : "");
+	// The live edge says "Thinking" only when nothing else on screen accounts for the
+	// wait: no running activity (a call draws its own spinner, a reconnect notice its
+	// own card), no decision waiting on the reader, and at least one step below the
+	// Working row, which is otherwise the live edge itself.
+	const showThinking =
+		group.live &&
+		!startup &&
+		!group.blocked &&
+		workedRuns.some((run) => !rendersNothing(run)) &&
+		!group.items.some((item) => item.kind === "activity" && item.status === "running");
 	const renderRun = (run: TimelineRun) =>
 		run.kind === "activities" ? (
 			<ActivityRun
@@ -3728,6 +3740,12 @@ const TurnGroup = memo(function TurnGroup({
 	const outcome = showSettledStatus ? group.outcome : undefined;
 	if (!outcome) {
 		body.push(...workedRuns.map(renderRun));
+		// Where the next step will land, so it sits above the plan and changed files.
+		if (showThinking) {
+			body.push(
+				<LiveThinkingStatus key="turn-thinking" quietSince={quiet.since} observed={quiet.observed} />,
+			);
+		}
 	} else if (foldedRuns.length > 0) {
 		const disclosureKey = `${group.key}:worked`;
 		body.push(
@@ -4302,4 +4320,27 @@ function rendersNothing(run: TimelineRun): boolean {
 	if (run.kind !== "single" || !item) return false;
 	if (item.kind === "message") return item.role === "assistant" && item.text.trim() === "";
 	return item.activityKind === "user_input" || (item.activityKind === "approval" && item.status === "pending");
+}
+
+/**
+ * Changes whenever the turn visibly moves: a new row, or a new revision of one.
+ * The daemon bumps a row's revision on every streamed delta and every settle.
+ */
+function turnProgressKey(items: readonly ConversationItem[]): string {
+	let revisions = 0;
+	for (const item of items) revisions += item.revision;
+	return `${items.length}:${revisions}`;
+}
+
+/**
+ * When this client last saw `progress` change. `observed` is false until it sees
+ * a change itself: the value it mounted with says nothing about when it started.
+ */
+function useQuietSince(progress: string): { since: number; observed: boolean } {
+	const [quiet, setQuiet] = useState(() => ({ progress, since: Date.now(), observed: false }));
+	if (quiet.progress === progress) return quiet;
+	// Adjusted during render, so the frame that shows the new row also restarts the wait.
+	const next = { progress, since: Date.now(), observed: true };
+	setQuiet(next);
+	return next;
 }
