@@ -1,57 +1,14 @@
 import * as Dialog from "@radix-ui/react-dialog";
-import { useQueries } from "@tanstack/react-query";
 import { StickyNote } from "lucide-react";
 import { useEffect, useMemo } from "react";
 import { useTranslation } from "react-i18next";
+import { useProjectOwnerAvatars } from "../hooks/useProjectOwnerAvatars";
 import { useRemoteWorkspaces, useWorkspaceQuery } from "../hooks/useWorkspaceQuery";
 import { labelForHost } from "../lib/host-clients";
-import { apiClient, apiErrorMessage } from "../lib/api-client";
+import { ProjectOwnerAvatar } from "./ProjectOwnerAvatar";
 import { TaskComposer } from "./TaskComposer";
-import { CLOUD_PROJECT_KIND, STANDALONE_WORKSPACE_ID, STANDALONE_PROJECT_KIND } from "../types/workspace";
+import { STANDALONE_WORKSPACE_ID, STANDALONE_PROJECT_KIND } from "../types/workspace";
 import { SettingsOptionMenu } from "./settings/SettingsOptionMenu";
-
-function repositoryOwnerAvatar(repo: string): { owner: string; url: string } | null {
-	const value = repo.trim();
-	const scp = value.match(/^[^/@:\s]+@([^/:\s]+):(.+)$/);
-	let host: string;
-	let pathname: string;
-	if (scp?.[1] && scp[2]) {
-		host = scp[1].toLowerCase();
-		pathname = scp[2];
-	} else {
-		try {
-			const parsed = new URL(value.includes("://") ? value : `https://${value}`);
-			host = parsed.hostname.toLowerCase();
-			pathname = parsed.pathname;
-		} catch {
-			return null;
-		}
-	}
-	const owner = pathname.replace(/^\/+|\/+$/g, "").split("/")[0]?.replace(/\.git$/, "");
-	if (!owner) return null;
-	const encodedOwner = encodeURIComponent(owner);
-	if (host === "github.com") return { owner, url: `https://github.com/${encodedOwner}.png?size=64` };
-	if (host === "gitlab.com") return { owner, url: `https://gitlab.com/-/avatar?username=${encodedOwner}` };
-	if (host === "bitbucket.org") return { owner, url: `https://bitbucket.org/account/${encodedOwner}/avatar/64/` };
-	return { owner, url: `https://unavatar.io/${encodeURIComponent(host)}/${encodedOwner}` };
-}
-
-function ProjectOwnerAvatar({ avatar, className }: { avatar: { owner: string; url: string }; className: string }) {
-	return (
-		<span className={`relative inline-flex shrink-0 items-center justify-center overflow-hidden rounded-full border border-card bg-muted font-medium text-muted-foreground ${className}`} aria-hidden="true">
-			<span className="text-[0.65em] leading-none">{avatar.owner.charAt(0).toUpperCase()}</span>
-			<img
-				key={avatar.url}
-				width={18}
-				height={18}
-				className="absolute inset-0 size-full rounded-full object-cover"
-				src={avatar.url}
-				alt=""
-				onError={(event) => { event.currentTarget.style.visibility = "hidden"; }}
-			/>
-		</span>
-	);
-}
 
 type NewTaskDialogProps = {
 	open: boolean;
@@ -70,42 +27,7 @@ export function NewTaskDialog({ open, projectId, hostId, onProjectChange, onCrea
 	const projects = useMemo(() => workspaces.filter(
 		(workspace) => workspace.id !== STANDALONE_WORKSPACE_ID && workspace.kind !== STANDALONE_PROJECT_KIND,
 	), [workspaces]);
-	const localProjects = useMemo(() => hostId ? [] : projects.filter((project) => project.kind !== CLOUD_PROJECT_KIND), [hostId, projects]);
-	const localProjectDetails = useQueries({
-		queries: localProjects.map((project) => ({
-			queryKey: ["project", project.id],
-			enabled: open,
-			staleTime: 30_000,
-			queryFn: async () => {
-				const { data, error } = await apiClient.GET("/api/v1/projects/{id}", {
-					params: { path: { id: project.id } },
-				});
-				if (error) throw new Error(apiErrorMessage(error));
-				if (data?.status !== "ok") return undefined;
-				return data.project;
-			},
-		})),
-	});
-	const projectAvatars = useMemo(() => new Map(projects.map((project) => {
-		const seen = new Set<string>();
-		const detailsIndex = localProjects.findIndex((localProject) => localProject.id === project.id);
-		const details = detailsIndex >= 0 ? localProjectDetails[detailsIndex]?.data : undefined;
-		const primaryRepo = details && "repo" in details && typeof details.repo === "string" ? details.repo : "";
-		const workspaceRepos = details && "workspaceRepos" in details ? details.workspaceRepos ?? [] : project.workspaceRepos ?? [];
-		const repositories = [
-			...(primaryRepo ? [{ repo: primaryRepo }] : []),
-			...workspaceRepos,
-		];
-		const avatars = repositories.flatMap(({ repo }) => {
-			const avatar = repositoryOwnerAvatar(repo);
-			if (!avatar) return [];
-			const identity = `${new URL(avatar.url).hostname}/${avatar.owner.toLowerCase()}`;
-			if (seen.has(identity)) return [];
-			seen.add(identity);
-			return [avatar];
-		});
-		return [project.id, avatars] as const;
-	})), [localProjectDetails, localProjects, projects]);
+	const projectAvatars = useProjectOwnerAvatars(projects, { enabled: open });
 	const selectedProjectId = projectId ?? STANDALONE_WORKSPACE_ID;
 	const selectedProject = projects.find((project) => project.id === selectedProjectId);
 	const selectedProjectName = selectedProject?.name ?? t("standalone.workspaceName");

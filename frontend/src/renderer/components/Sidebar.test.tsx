@@ -2282,6 +2282,37 @@ describe("Sidebar", () => {
 		expect(projectRow?.querySelector("[data-project-label]")).toHaveClass("translate-y-px");
 	});
 
+	it("marks a project with its repository owner's avatar, as the New Task picker does", async () => {
+		const fallback = getMock.getMockImplementation();
+		getMock.mockImplementation((path: string, options?: { params?: { path?: { id?: string } } }) =>
+			path === "/api/v1/projects/{id}" && options?.params?.path?.id === "proj-1"
+				? Promise.resolve({
+					data: { status: "ok", project: { id: "proj-1", repo: "git@github.com:acme/web.git", workspaceRepos: [] } },
+					error: undefined,
+				})
+				: fallback?.(path),
+		);
+		renderSidebar();
+
+		const projectRow = screen.getByText("Project One").closest('button, [role="button"]');
+		const folderSlot = projectRow?.querySelector("[data-project-folder-icon]");
+		await waitFor(() =>
+			expect(folderSlot?.querySelector("img")).toHaveAttribute("src", "https://github.com/acme.png?size=64"),
+		);
+		expect(folderSlot?.querySelector("svg")).not.toBeInTheDocument();
+		// The hover chevron still owns expand/collapse.
+		expect(projectRow?.querySelector("[data-project-chevron-icon] svg")).toBeInTheDocument();
+	});
+
+	it("keeps the folder for a project with no repository to show", () => {
+		renderSidebar();
+
+		const projectRow = screen.getByText("Project One").closest('button, [role="button"]');
+		const folderSlot = projectRow?.querySelector("[data-project-folder-icon]");
+		expect(folderSlot?.querySelector("svg")).toBeInTheDocument();
+		expect(folderSlot?.querySelector("img")).not.toBeInTheDocument();
+	});
+
 	it("caps the project list at 10 until Show more is clicked", async () => {
 		const user = userEvent.setup();
 		const manyProjects = Array.from({ length: 14 }, (_, index) => ({

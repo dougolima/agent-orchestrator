@@ -78,6 +78,8 @@ import { canResumeAgent, resumeAgentOnOpen, useCanResumeAgent } from "../hooks/u
 import { cloudSessionsQueryKey, workspaceQueryKey, workspaceQueryKeyForHost } from "../hooks/useWorkspaceQuery";
 import { conversationQueryKey, conversationQueryOptions } from "../hooks/useConversation";
 import { usePinSession, useUnpinSession } from "../hooks/usePinSession";
+import { useProjectOwnerAvatar } from "../hooks/useProjectOwnerAvatars";
+import { ProjectOwnerAvatar } from "./ProjectOwnerAvatar";
 import { spawnCloudOrchestrator } from "../lib/cloud-orchestrator";
 import { resumeOrchestrator, spawnOrchestrator } from "../lib/spawn-orchestrator";
 import { formatTimeCompact, formatTimeTerse } from "../lib/format-time";
@@ -1317,6 +1319,9 @@ const ProjectItem = memo(function ProjectItem({
 			(session) => session.id === selection.activeSessionId && session.kind === "orchestrator",
 		);
 	const projectActive = dashboardActive || orchestratorActive;
+	// The repository owner identifies a project at a glance, as in the New Task
+	// project picker; the folder stays for projects without one.
+	const ownerAvatar = useProjectOwnerAvatar(workspace);
 	const queryClient = useQueryClient();
 	const [removeError, setRemoveError] = useState<string | null>(null);
 	const [isRemoving, setIsRemoving] = useState(false);
@@ -1586,7 +1591,9 @@ const ProjectItem = memo(function ProjectItem({
 											className="inline-flex size-icon-md items-center justify-center transition-[scale] duration-normal ease-[var(--ease-out)] motion-reduce:transition-none"
 											data-project-folder-icon=""
 										>
-											{expanded ? <FolderOpen strokeWidth={1.75} /> : <Folder strokeWidth={1.75} />}
+											{ownerAvatar ? (
+												<ProjectOwnerAvatar avatar={ownerAvatar} className="size-icon-md border-0" />
+											) : expanded ? <FolderOpen strokeWidth={1.75} /> : <Folder strokeWidth={1.75} />}
 										</span>
 										<span
 											className={cn(
@@ -1605,7 +1612,9 @@ const ProjectItem = memo(function ProjectItem({
 										aria-hidden="true"
 										className="relative z-[1] hidden size-8 items-center justify-center group-data-[collapsible=icon]:inline-flex"
 									>
-										{expanded ? <FolderOpen className="size-5" strokeWidth={1.75} /> : <Folder className="size-5" strokeWidth={1.75} />}
+										{ownerAvatar ? (
+											<ProjectOwnerAvatar avatar={ownerAvatar} className="size-5 border-0" />
+										) : expanded ? <FolderOpen className="size-5" strokeWidth={1.75} /> : <Folder className="size-5" strokeWidth={1.75} />}
 									</span>
 									<span
 										className="sidebar-expanded-chrome relative z-[1] min-w-0 flex-1 translate-y-px truncate group-data-[collapsible=icon]:hidden"
