@@ -17,6 +17,7 @@ import {
 	npmInvocation,
 	patchClaudeContextUsage,
 	patchClaudeFoldedPromptSettlement,
+	patchClaudeHibernationCheck,
 	patchClaudeRetryDetails,
 	patchClaudeStaleIdleDebt,
 	pruneNodeDistribution,
@@ -86,6 +87,7 @@ const npm = npmInvocation(["ci", "--omit=dev", "--omit=optional", "--ignore-scri
 run(npm.command, npm.args, { cwd: outDir });
 patchClaudeRetryDetails(claudeAdapter);
 patchClaudeContextUsage(claudeAdapter);
+patchClaudeHibernationCheck(claudeAdapter);
 patchClaudeFoldedPromptSettlement(claudeAdapter);
 patchClaudeStaleIdleDebt(claudeAdapter);
 
