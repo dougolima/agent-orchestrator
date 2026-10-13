@@ -1742,7 +1742,20 @@ export function createBrowserViewHost(
         return;
       }
       const closingTabId = session.activeTabId;
-      if (isNativePage && session.tabs.size > 1) {
+      if (session.tabs.size === 1) {
+        // Focus the shell first so a fast second ⌘W cannot land in the hidden
+        // page and fall through to the menu's Close item.
+        const shell = shellContents(options);
+        shell.focus();
+        forgetNativeFocus(session.viewId);
+        forgetBrowserShortcutTarget(session.viewId);
+        shell.send("browser:closePanel", session.viewId);
+        void openUserTab(session)
+          .then(() => closeUserTab(session, closingTabId))
+          .catch(() => undefined);
+        return;
+      }
+      if (isNativePage) {
         // The focused view is about to be destroyed asynchronously. Move OS
         // focus to its replacement synchronously — making it visible first
         // so the focus sticks — or a fast second ⌘W lands in focus limbo
@@ -2263,13 +2276,16 @@ export function createBrowserViewHost(
     rendererOwnersByViewId.delete(viewId);
     forgetNativeFocus(viewId);
     forgetBrowserShortcutTarget(viewId);
-    // When the window is already gone (dispose fired from mainWindow "closed"),
-    // Electron has torn down contentView and the child WebContentsViews. Touching
-    // them throws "Object has been destroyed", so just drop our reference.
+    // BaseWindow close leaves child WebContents alive, but destroys contentView.
     if (options.mainWindow.isDestroyed?.()) {
       for (const entry of session.tabs.values()) {
         tabsByWebContentsId.delete(entry.view.webContents.id);
         disposeNetworkCapture(entry, "session-closed");
+        try {
+          entry.view.webContents.close?.();
+        } catch {
+          // The tab may already have closed before the window teardown.
+        }
       }
       if (partitionToClear) clearTemporaryPartition(partitionToClear);
       return;

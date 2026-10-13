@@ -34,7 +34,7 @@ const (
 // That is deliberate: a locked keychain must never be reported as a missing
 // or invalid credential, because the user is very likely signed in perfectly
 // well and simply has the keychain locked.
-func readKeychain(ctx context.Context, opts ResolveOptions) (string, Kind, bool) {
+func readKeychain(ctx context.Context, opts ResolveOptions) (storedOAuth, bool) {
 	runner := opts.Runner
 	if runner == nil {
 		runner = execCommand
@@ -48,14 +48,14 @@ func readKeychain(ctx context.Context, opts ResolveOptions) (string, Kind, bool)
 	apiKeyOut, apiKeyErr := runner(probeCtx, "security",
 		"find-generic-password", "-s", keychainServiceManagedKey, "-w")
 	if probeCtx.Err() != nil {
-		return "", "", false
+		return storedOAuth{}, false
 	}
 	if apiKeyErr == nil {
 		if raw := strings.TrimSpace(string(apiKeyOut)); raw != "" && !strings.HasPrefix(raw, "{") {
-			return raw, kindForToken(raw), true
+			return storedOAuth{token: raw, kind: kindForToken(raw)}, true
 		}
-		if token, ok := oauthTokenFromCredentialsJSON(apiKeyOut); ok {
-			return token, KindOAuthToken, true
+		if stored, ok := oauthTokenFromCredentialsJSON(apiKeyOut); ok {
+			return stored, true
 		}
 	}
 
@@ -64,17 +64,17 @@ func readKeychain(ctx context.Context, opts ResolveOptions) (string, Kind, bool)
 	out, err := runner(probeCtx, "security",
 		"find-generic-password", "-s", keychainServiceCredentials, "-w")
 	if probeCtx.Err() != nil {
-		return "", "", false
+		return storedOAuth{}, false
 	}
 	if err == nil {
-		if token, ok := oauthTokenFromCredentialsJSON(out); ok {
-			return token, KindOAuthToken, true
+		if stored, ok := oauthTokenFromCredentialsJSON(out); ok {
+			return stored, true
 		}
 		if raw := strings.TrimSpace(string(out)); raw != "" && !strings.HasPrefix(raw, "{") {
-			return raw, KindOAuthToken, true
+			return storedOAuth{token: raw, kind: KindOAuthToken}, true
 		}
 	}
-	return "", "", false
+	return storedOAuth{}, false
 }
 
 // kindForToken selects the auth header from the token prefix. Claude Code

@@ -586,6 +586,30 @@ describe("browser shortcut routing", () => {
 		expect(webContents.findInPage).toHaveBeenCalledOnce();
 	});
 
+	it("replaces the last tab with a blank tab and closes the browser panel on ⌘W", async () => {
+		const { emitBeforeInput, host, invoke, shellSend } = setupHost();
+		const state = await invoke("browser:ensure", "sess-1");
+		await invoke("browser:navigate", { viewId: state.viewId, url: "https://example.test/" });
+		const before = (await invoke("browser:getTabs", state.viewId)) as unknown as BrowserTabsState;
+		const oldTabId = before.activeTabId;
+		shellSend.mockClear();
+
+		const closeEvent = emitBeforeInput({ key: "w", control: true });
+		expect(closeEvent.preventDefault).toHaveBeenCalled();
+		expect(shellSend).toHaveBeenCalledWith("browser:closePanel", state.viewId);
+		expect(shellSend).not.toHaveBeenCalledWith(CLOSE_SHELL_TERMINAL_SHORTCUT_CHANNEL);
+		expect(host.isLastUsedBrowser()).toBe(false);
+		await vi.waitFor(() => {
+			expect(shellSend).toHaveBeenCalledWith(
+				"browser:tabsState",
+				expect.objectContaining({ change: expect.objectContaining({ kind: "closed", tabId: oldTabId }) }),
+			);
+		});
+		const tabs = (await invoke("browser:getTabs", state.viewId)) as unknown as BrowserTabsState;
+		expect(tabs.tabs).toHaveLength(1);
+		expect(tabs.activeTabId).not.toBe(oldTabId);
+	});
+
 	it("opens, focuses, and closes browser tabs without dispatching terminal shortcuts", async () => {
 		const { emitBeforeInput, invoke, shellSend, webContents } = setupHost();
 		const state = await invoke("browser:ensure", "sess-1");
@@ -698,22 +722,20 @@ describe("browser shortcut routing", () => {
 		expect(shellSend).not.toHaveBeenCalledWith(CLOSE_SHELL_TERMINAL_SHORTCUT_CHANNEL);
 		expect(host.isLastUsedBrowser()).toBe(true);
 
-		// Second ⌘W with one tab left is a safe no-op — still browser-owned, so
-		// main.ts keeps suppressing the terminal/window close chord.
+		// Second ⌘W with one tab left swaps it for a blank tab and closes the
+		// panel; the hidden browser releases the shortcut target to the shell.
 		shellSend.mockClear();
 		const secondClose = emitShellBeforeInput({ key: "w", control: true });
 		expect(secondClose.preventDefault).toHaveBeenCalled();
-		await vi.waitFor(async () => {
-			const tabs = (await invoke("browser:getTabs", state.viewId)) as unknown as BrowserTabsState;
-			expect(tabs.tabs).toHaveLength(1);
-		});
+		expect(shellSend).toHaveBeenCalledWith("browser:closePanel", state.viewId);
 		expect(shellSend).not.toHaveBeenCalledWith(CLOSE_SHELL_TERMINAL_SHORTCUT_CHANNEL);
-		expect(host.isLastUsedBrowser()).toBe(true);
-
-		// Same from the native page: no-op, target retained.
-		emitBeforeInput({ key: "w", control: true });
-		await Promise.resolve();
-		expect(host.isLastUsedBrowser()).toBe(true);
+		expect(host.isLastUsedBrowser()).toBe(false);
+		await vi.waitFor(() => {
+			expect(shellSend).toHaveBeenCalledWith(
+				"browser:tabsState",
+				expect.objectContaining({ change: expect.objectContaining({ kind: "closed" }) }),
+			);
+		});
 		const tabs = (await invoke("browser:getTabs", state.viewId)) as unknown as BrowserTabsState;
 		expect(tabs.tabs).toHaveLength(1);
 	});
@@ -4560,7 +4582,7 @@ describe("browser annotation IPC", () => {
 });
 
 describe("dispose after the window is destroyed", () => {
-	it("does not touch contentView/views once the window reports destroyed", async () => {
+	it.each(["live", "already destroyed"])("closes %s tab contents without touching the destroyed window", async (contentsState) => {
 		const handlers = new Map<string, InvokeHandler>();
 		const view = {
 			webContents: {
@@ -4578,9 +4600,8 @@ describe("dispose after the window is destroyed", () => {
 				send: () => undefined,
 				setWindowOpenHandler: () => undefined,
 				stop: () => undefined,
-				// Real Electron throws "Object has been destroyed" here after close.
 				close: vi.fn(() => {
-					throw new Error("Object has been destroyed");
+					if (contentsState === "already destroyed") throw new Error("Object has been destroyed");
 				}),
 			},
 			setBounds: () => undefined,
@@ -4592,7 +4613,10 @@ describe("dispose after the window is destroyed", () => {
 		});
 		const host = createBrowserViewHost({
 			mainWindow: {
-				contentView: { addChildView: () => undefined, removeChildView },
+				get contentView() {
+					if (destroyed) throw new Error("Object has been destroyed");
+					return { addChildView: () => undefined, removeChildView };
+				},
 				getContentBounds: () => ({ x: 0, y: 0, width: 800, height: 600 }),
 				webContents: { id: 1, send: () => undefined },
 				isDestroyed: () => destroyed,
@@ -4614,9 +4638,9 @@ describe("dispose after the window is destroyed", () => {
 
 		destroyed = true; // window "closed" fired
 
-		expect(() => host.dispose()).not.toThrow();
+		await expect(host.dispose()).resolves.toBeUndefined();
 		expect(removeChildView).not.toHaveBeenCalled();
-		expect(view.webContents.close).not.toHaveBeenCalled();
+		expect(view.webContents.close).toHaveBeenCalledOnce();
 	});
 
 	it("deduplicates host disposal while runtime cleanup is in flight", async () => {
