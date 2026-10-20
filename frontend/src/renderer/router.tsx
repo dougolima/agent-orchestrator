@@ -38,6 +38,10 @@ export function createAppRouter(queryClient: QueryClient) {
 		defaultPendingMs: 0,
 		// A cancelled query losing the teardown race must not blank the window.
 		defaultErrorComponent: RouteErrorFallback,
+		// The router's default keeps a shown pending component up for at least
+		// 500ms. With pendingMs 0 it always shows, so every launch and reload
+		// held the startup screen for half a second after the data had arrived.
+		defaultPendingMinMs: 0,
 		// Always re-run loaders when a route is preloaded or visited so React
 		// Query's cache is the single source of truth for staleness.
 		defaultPreloadStaleTime: 0,
