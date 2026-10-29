@@ -83,6 +83,7 @@ const SETTINGS_ENTRIES: SettingsEntry[] = [
 	{ id: "terminal-shell", section: "general", label: "settings.terminalShell.label", keywords: ["zsh", "bash", "fish", "powershell", "shell path"] },
 	{ id: "copy-on-select", section: "general", label: "settings.terminalCopyOnSelect", keywords: ["terminal copy", "selection", "clipboard"] },
 	{ id: "sound", section: "general", label: "settings.soundNotifications", keywords: ["sounds", "chime", "alert sound"] },
+	{ id: "agent-finished", section: "general", label: "settings.agentFinishedNotifications", keywords: ["agent done", "turn finished", "alert", "notify"] },
 	{ id: "privacy", section: "general", label: "settings.privacy", keywords: ["data", "tracking"] },
 	{ id: "analytics", section: "general", label: "settings.analytics.label", keywords: ["telemetry", "tracking", "opt out", "posthog"] },
 	{ id: "error-events", section: "general", label: "settings.telemetryEvents.label", keywords: ["crash reports", "sentry", "telemetry"] },
