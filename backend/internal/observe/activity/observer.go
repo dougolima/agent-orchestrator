@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
@@ -21,6 +20,7 @@ const (
 
 // Config controls activity reconciliation polling.
 type Config struct {
+	DataDir     string
 	Tick        time.Duration
 	StaleAfter  time.Duration
 	OutputLines int
@@ -58,6 +58,7 @@ func terminalOutput(ctx context.Context, runtime outputReader, handle ports.Runt
 
 // Observer reconciles stale hook activity from adapter-owned terminal markers.
 type Observer struct {
+	dataDir     string
 	sessions    sessionSource
 	sink        activitySink
 	runtime     outputReader
@@ -72,6 +73,7 @@ type Observer struct {
 // New builds an activity observer.
 func New(sessions sessionSource, sink activitySink, runtime outputReader, agents ports.AgentResolver, cfg Config) *Observer {
 	o := &Observer{
+		dataDir:     cfg.DataDir,
 		sessions:    sessions,
 		sink:        sink,
 		runtime:     runtime,
@@ -140,6 +142,15 @@ func (o *Observer) reconcile(ctx context.Context, session domain.SessionRecord, 
 		options = provider.TerminalActivityOptions()
 	}
 	nativeDecisionCards := options.SupportsBlocked
+	rendered, supportsRendered := agent.(interface{ RequiresRenderedActivity() bool })
+	requiresRendered := supportsRendered && rendered.RequiresRenderedActivity()
+	// Hook-owned permission blocks stay sticky unless the adapter can observe
+	// the current rendered modal and its resolution.
+	if session.Activity.State == domain.ActivityBlocked && !requiresRendered && !nativeDecisionCards {
+		return
+	}
+
+	nativeDecisionCards = nativeDecisionCards || requiresRendered
 	continuous, ok := agent.(ports.ContinuousTerminalActivityDetector)
 	if !ok || !continuous.ContinuouslyDetectTerminalActivity() {
 		if session.Activity.State == domain.ActivityWaitingInput {
@@ -159,7 +170,15 @@ func (o *Observer) reconcile(ctx context.Context, session domain.SessionRecord, 
 	var output string
 	var err error
 	handle := ports.RuntimeHandle{ID: session.Metadata.RuntimeHandleID}
-	if rendered, ok := o.runtime.(ports.StyledTerminalOutputReader); options.PreferStyledOutput && ok {
+	if requiresRendered {
+		reader, ok := o.runtime.(interface {
+			GetStyledOutput(context.Context, ports.RuntimeHandle, int) (string, error)
+		})
+		if !ok {
+			return
+		}
+		output, err = reader.GetStyledOutput(ctx, handle, o.outputLines)
+	} else if rendered, ok := o.runtime.(ports.StyledTerminalOutputReader); options.PreferStyledOutput && ok {
 		output, err = rendered.GetStyledOutput(ctx, handle, o.outputLines)
 	} else {
 		output, err = terminalOutput(ctx, o.runtime, handle, o.outputLines)
@@ -168,22 +187,36 @@ func (o *Observer) reconcile(ctx context.Context, session domain.SessionRecord, 
 		o.logger.Debug("activity observer: terminal output unavailable", "session", session.ID, "err", err)
 		return
 	}
-	if strings.TrimSpace(output) == "" {
+	state, ok := detector.DetectTerminalActivity(output)
+	if !ok || (state != domain.ActivityActive && state != domain.ActivityIdle && state != domain.ActivityWaitingInput && (!nativeDecisionCards || state != domain.ActivityBlocked)) {
 		return
 	}
-	state, ok := detector.DetectTerminalActivity(output)
-	if !ok || state == session.Activity.State ||
-		(state != domain.ActivityActive && state != domain.ActivityIdle && state != domain.ActivityWaitingInput && (!nativeDecisionCards || state != domain.ActivityBlocked)) {
+	if state == session.Activity.State {
 		return
+	}
+	nativeID := ""
+	if resolver, supports := agent.(ports.AgentNativeSessionResolver); supports && o.dataDir != "" {
+		resolveCfg := ports.NativeSessionResolveConfig{DataDir: o.dataDir, SessionID: session.ID, LaunchID: session.Metadata.RuntimeLaunchID}
+		id, found, resolveErr := resolver.ResolveNativeSessionID(ctx, resolveCfg)
+		if resolveErr != nil {
+			// Native identity is optional evidence; a failed lookup must not
+			// discard activity established by the current terminal frame.
+			o.logger.Debug("activity observer: native identity unavailable", "session", session.ID, "err", resolveErr)
+		} else if found {
+			nativeID = id
+		}
 	}
 	event := "terminal-" + string(state)
-	if nativeDecisionCards && session.Activity.State == domain.ActivityBlocked && (state == domain.ActivityActive || state == domain.ActivityIdle) {
+	if nativeDecisionCards && session.Activity.State == domain.ActivityBlocked && state != domain.ActivityBlocked {
+		// A current native composer/busy frame resolves the prior modal. Keep
+		// its observed destination state: lifecycle accepts this boundary for
+		// active, idle, and waiting input, and clears the blocked tool flight.
 		event = "permission-resolved"
-	}
-	if state == domain.ActivityWaitingInput {
+	} else if state == domain.ActivityWaitingInput {
 		event = "terminal-waiting-input"
 	}
 	err = o.sink.ApplyActivitySignal(ctx, session.ID, ports.ActivitySignal{
+		AgentSessionID:   nativeID,
 		Valid:            true,
 		State:            state,
 		Timestamp:        now,

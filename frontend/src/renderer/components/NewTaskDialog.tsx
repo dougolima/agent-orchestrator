@@ -1,15 +1,58 @@
 import * as Dialog from "@radix-ui/react-dialog";
+import { useQueries } from "@tanstack/react-query";
 import { StickyNote } from "lucide-react";
 import { useEffect, useMemo } from "react";
 import { useUiStore } from "../stores/ui-store";
 import { useTranslation } from "react-i18next";
-import { useProjectOwnerAvatars } from "../hooks/useProjectOwnerAvatars";
 import { useRemoteWorkspaces, useWorkspaceQuery } from "../hooks/useWorkspaceQuery";
 import { labelForHost } from "../lib/host-clients";
-import { ProjectOwnerAvatar } from "./ProjectOwnerAvatar";
+import { apiClient, apiErrorMessage } from "../lib/api-client";
 import { TaskComposer } from "./TaskComposer";
-import { STANDALONE_WORKSPACE_ID, STANDALONE_PROJECT_KIND } from "../types/workspace";
+import { CLOUD_PROJECT_KIND, STANDALONE_WORKSPACE_ID } from "../types/workspace";
 import { SettingsOptionMenu } from "./settings/SettingsOptionMenu";
+
+function repositoryOwnerAvatar(repo: string): { owner: string; url: string } | null {
+	const value = repo.trim();
+	const scp = value.match(/^[^/@:\s]+@([^/:\s]+):(.+)$/);
+	let host: string;
+	let pathname: string;
+	if (scp?.[1] && scp[2]) {
+		host = scp[1].toLowerCase();
+		pathname = scp[2];
+	} else {
+		try {
+			const parsed = new URL(value.includes("://") ? value : `https://${value}`);
+			host = parsed.hostname.toLowerCase();
+			pathname = parsed.pathname;
+		} catch {
+			return null;
+		}
+	}
+	const owner = pathname.replace(/^\/+|\/+$/g, "").split("/")[0]?.replace(/\.git$/, "");
+	if (!owner) return null;
+	const encodedOwner = encodeURIComponent(owner);
+	if (host === "github.com") return { owner, url: `https://github.com/${encodedOwner}.png?size=64` };
+	if (host === "gitlab.com") return { owner, url: `https://gitlab.com/-/avatar?username=${encodedOwner}` };
+	if (host === "bitbucket.org") return { owner, url: `https://bitbucket.org/account/${encodedOwner}/avatar/64/` };
+	return { owner, url: `https://unavatar.io/${encodeURIComponent(host)}/${encodedOwner}` };
+}
+
+function ProjectOwnerAvatar({ avatar, className }: { avatar: { owner: string; url: string }; className: string }) {
+	return (
+		<span className={`relative inline-flex shrink-0 items-center justify-center overflow-hidden rounded-full border border-card bg-muted font-medium text-muted-foreground ${className}`} aria-hidden="true">
+			<span className="text-[0.65em] leading-none">{avatar.owner.charAt(0).toUpperCase()}</span>
+			<img
+				key={avatar.url}
+				width={18}
+				height={18}
+				className="absolute inset-0 size-full rounded-full object-cover"
+				src={avatar.url}
+				alt=""
+				onError={(event) => { event.currentTarget.style.visibility = "hidden"; }}
+			/>
+		</span>
+	);
+}
 
 type NewTaskDialogProps = {
 	open: boolean;
@@ -27,18 +70,50 @@ export function NewTaskDialog({ open, projectId, hostId, onProjectChange, onCrea
 	const localWorkspaces = useWorkspaceQuery({ subscribed: open }).data ?? [];
 	const remoteWorkspaces = useRemoteWorkspaces({ subscribed: open }).data ?? [];
 	const workspaces = hostId ? remoteWorkspaces.filter((workspace) => workspace.hostId === hostId) : localWorkspaces;
-	const projects = useMemo(() => workspaces.filter(
-		(workspace) => workspace.id !== STANDALONE_WORKSPACE_ID && workspace.kind !== STANDALONE_PROJECT_KIND,
-	), [workspaces]);
-	const projectAvatars = useProjectOwnerAvatars(projects, { enabled: open });
+	// This dialog serves cloud projects only for now; every other project starts
+	// from the new chat page.
+	const projects = useMemo(() => workspaces.filter((workspace) => workspace.kind === CLOUD_PROJECT_KIND), [workspaces]);
+	const localProjects = useMemo(() => hostId ? [] : projects.filter((project) => project.kind !== CLOUD_PROJECT_KIND), [hostId, projects]);
+	const localProjectDetails = useQueries({
+		queries: localProjects.map((project) => ({
+			queryKey: ["project", project.id],
+			enabled: open,
+			staleTime: 30_000,
+			queryFn: async () => {
+				const { data, error } = await apiClient.GET("/api/v1/projects/{id}", {
+					params: { path: { id: project.id } },
+				});
+				if (error) throw new Error(apiErrorMessage(error));
+				if (data?.status !== "ok") return undefined;
+				return data.project;
+			},
+		})),
+	});
+	const projectAvatars = useMemo(() => new Map(projects.map((project) => {
+		const seen = new Set<string>();
+		const detailsIndex = localProjects.findIndex((localProject) => localProject.id === project.id);
+		const details = detailsIndex >= 0 ? localProjectDetails[detailsIndex]?.data : undefined;
+		const primaryRepo = details && "repo" in details && typeof details.repo === "string" ? details.repo : "";
+		const workspaceRepos = details && "workspaceRepos" in details ? details.workspaceRepos ?? [] : project.workspaceRepos ?? [];
+		const repositories = [
+			...(primaryRepo ? [{ repo: primaryRepo }] : []),
+			...workspaceRepos,
+		];
+		const avatars = repositories.flatMap(({ repo }) => {
+			const avatar = repositoryOwnerAvatar(repo);
+			if (!avatar) return [];
+			const identity = `${new URL(avatar.url).hostname}/${avatar.owner.toLowerCase()}`;
+			if (seen.has(identity)) return [];
+			seen.add(identity);
+			return [avatar];
+		});
+		return [project.id, avatars] as const;
+	})), [localProjectDetails, localProjects, projects]);
 	const selectedProjectId = projectId ?? STANDALONE_WORKSPACE_ID;
 	const selectedProject = projects.find((project) => project.id === selectedProjectId);
 	const selectedProjectName = selectedProject?.name ?? t("standalone.workspaceName");
 	const selectedProjectAvatar = projectAvatars.get(selectedProjectId)?.[0];
-	const projectOptions = [
-		{ value: STANDALONE_WORKSPACE_ID, label: t("standalone.workspaceName") },
-		...projects.map((project) => ({ value: project.id, label: project.name })),
-	];
+	const projectOptions = projects.map((project) => ({ value: project.id, label: project.name }));
 	useEffect(() => {
 		if (!open) return;
 		for (const avatars of projectAvatars.values()) {
@@ -52,7 +127,7 @@ export function NewTaskDialog({ open, projectId, hostId, onProjectChange, onCrea
 		<Dialog.Root open={open && !settingsOpen} onOpenChange={onOpenChange}>
 			<Dialog.Portal>
 				<Dialog.Overlay className="dialog-overlay data-[state=open]:animate-overlay-in data-[state=closed]:animate-overlay-out" />
-				<Dialog.Content className="fixed left-1/2 top-1/2 z-overlay w-dialog-xl -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-lg border border-border bg-popover p-0 text-popover-foreground shadow-xl data-[state=open]:animate-modal-in data-[state=closed]:animate-modal-out motion-reduce:animate-none">
+				<Dialog.Content className="fixed left-1/2 top-1/2 z-overlay w-dialog-xl -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-lg border border-(--color-border-overlay) bg-popover p-0 text-popover-foreground shadow-(--shadow-popover) data-[state=open]:animate-modal-in data-[state=closed]:animate-modal-out motion-reduce:animate-none">
 					{/* The selected project is the dialog title; the composer remains the main surface. */}
 					<Dialog.Title className="settings-dialog-title flex flex-wrap items-center gap-x-1.5 px-3 pt-3">
 						<SettingsOptionMenu

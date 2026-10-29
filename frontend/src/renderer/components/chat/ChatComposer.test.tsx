@@ -236,7 +236,7 @@ describe("send keys", () => {
 
 		await typeInComposer(field, "hello");
 		expect(send).toBeEnabled();
-		expect(send).toHaveClass("bg-foreground", "text-background");
+		expect(send).toHaveClass("bg-foreground", "text-on-foreground");
 	});
 
 	it("keeps ordinary typing local after the draft becomes nonempty", async () => {
@@ -1350,7 +1350,7 @@ describe("sent message recall", () => {
 		expect(composerWireText(field)).toBe(`compare ${path} `);
 	});
 
-	it("recalls with Up while a Tab suggestion is offered, which dismisses it like any text", async () => {
+	it("recalls with Up while a Tab suggestion is offered, which temporarily hides it", async () => {
 		const onDismiss = vi.fn();
 		const { field, onSend } = renderComposer({
 			sentMessages: SENT,
@@ -1359,7 +1359,7 @@ describe("sent message recall", () => {
 		await typeInComposer(field, "");
 		expect(press(field, "ArrowUp")).toBe(true);
 		expect(composerWireText(field)).toBe("latest question");
-		expect(onDismiss).toHaveBeenCalled();
+		expect(onDismiss).not.toHaveBeenCalled();
 		expect(onSend).not.toHaveBeenCalled();
 	});
 
@@ -1696,6 +1696,26 @@ describe("steering", () => {
 		await waitFor(() => expect(screen.getByLabelText("Message the agent")).toHaveTextContent(""));
 		expect(onSteer).toHaveBeenCalledTimes(1);
 		expect(readChatSessionDraft(sessionId).composer.delivery).toBeUndefined();
+	});
+
+	it("clears a restored send the chat already holds, without the restart notice", async () => {
+		const sessionId = "send-snapshot-reconciliation";
+		// The answer is lost, as when the app restarts mid-send.
+		const onSend = vi.fn().mockRejectedValue(new Error("response lost"));
+		const first = render(<ChatComposer onSend={onSend} draftSessionId={sessionId} />);
+		const field = screen.getByLabelText("Message the agent");
+		await typeInComposer(field, "sent before the restart");
+		fireEvent.keyDown(field, { key: "Enter" });
+		await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+		await waitFor(() => expect(readChatSessionDraft(sessionId).composer.delivery?.state).toBe("dispatching"));
+		const clientMessageId = onSend.mock.calls[0]?.[2] as unknown as string;
+		first.unmount();
+
+		render(<ChatComposer onSend={onSend} draftSessionId={sessionId} acceptedClientMessageIds={new Set([clientMessageId])} />);
+		await waitFor(() => expect(readChatSessionDraft(sessionId).composer.delivery).toBeUndefined());
+		expect(screen.getByLabelText("Message the agent")).toHaveTextContent("");
+		expect(screen.queryByText(/wasn.t confirmed before Chat restarted/)).not.toBeInTheDocument();
+		expect(onSend).toHaveBeenCalledTimes(1);
 	});
 });
 
@@ -2660,6 +2680,16 @@ describe("attachments", () => {
 /* ---- disabled and busy states ------------------------------------------- */
 
 describe("unavailable states", () => {
+	it("keeps approval actions available below an attached notice and queue", async () => {
+		const approve = vi.fn();
+		render(<ChatComposer onSend={vi.fn()} disabled notice={<div data-composer-notice>Another writer</div>} queuedDock={<div>Queued message</div>} approval={<button onClick={approve}>Approve command</button>} />);
+		const notice = screen.getByText("Another writer");
+		expect(notice.previousElementSibling).toHaveAttribute("data-testid", "queued-composer-dock");
+		expect(notice.nextElementSibling?.tagName).toBe("FORM");
+		await userEvent.click(screen.getByRole("button", { name: "Approve command" }));
+		expect(approve).toHaveBeenCalledOnce();
+	});
+
 	it("explains a stopped controller and refuses to send", async () => {
 		const { onSend, field } = renderComposer({ disabled: true, skills: SKILLS });
 		expect(field).toHaveAttribute("aria-placeholder", expect.stringContaining("not connected"));

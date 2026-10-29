@@ -1,4 +1,3 @@
-import { AwakeControl } from "./AwakeControl";
 import { OrchestratorStartingChat } from "./chat/OrchestratorStartingChat";
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { useTranslation } from "react-i18next";
@@ -29,6 +28,8 @@ import {
 } from "../lib/session-presentation";
 import { useRestoreSession } from "../hooks/useRestoreSession";
 import { useTerminateSession } from "../hooks/useTerminateSession";
+import { useCloudCp } from "../hooks/useCloudCp";
+import { useSessionParticipants } from "../hooks/useSessionParticipants";
 import { useRemoteProjectQuery, useWorkspaceQuery, workspaceQueryKeyForHost } from "../hooks/useWorkspaceQuery";
 import { NotificationCenter } from "./NotificationCenter";
 import { BoardWelcome, ProjectBoardEmpty } from "./BoardEmptyStates";
@@ -46,7 +47,7 @@ import { useProjectOrchestratorAction } from "../hooks/useProjectOrchestratorAct
 import { openRemoteOrchestrator } from "../lib/remote-orchestrator";
 import { labelForHost } from "../lib/host-clients";
 import { useConnectedHosts } from "../hooks/useHostConnection";
-import { LOCAL_HOST, refKey } from "../lib/hosts";
+import { LOCAL_HOST, refKey, sessionUiKey } from "../lib/hosts";
 import { useShellMaybe } from "../lib/shell-context";
 import { sessionNavigateTarget } from "../lib/navigate-to-session";
 import { ProjectTerminationFeedback } from "./ShellTopbar";
@@ -128,6 +129,9 @@ export function SessionsBoard({ projectId, hostId }: SessionsBoardProps) {
 		.filter(isArchivedSession)
 		.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
 	const activeSessions = sessions.filter((candidate) => !isArchivedSession(candidate));
+	// Who is in each shared cloud session, read without joining any of them.
+	const participantsBySession = useSessionParticipants(activeSessions, !hostId);
+	const { userId: cloudUserId } = useCloudCp(!hostId && activeSessions.some((session) => Boolean(session.cloud)));
 	const boardSessions = activeSessions.map((session) =>
 		session.status === "no_signal" || session.displayStatus === "No signal"
 			? { ...session, kanbanColumn: "building" as const }
@@ -178,6 +182,13 @@ export function SessionsBoard({ projectId, hostId }: SessionsBoardProps) {
 	}, [navigate, hostId]);
 	const openSessionArtifact = useCallback((session: WorkspaceSession, path: string) => {
 		useUiStore.getState().requestWorkspaceFileOpen(session.id, path, hostId, "artifact");
+		openSession(session);
+	}, [openSession, hostId]);
+	const openSessionArtifacts = useCallback((session: WorkspaceSession) => {
+		const uiKey = sessionUiKey(session.id, hostId);
+		useUiStore.getState().initializeInspectorSession(uiKey, Boolean(session.previewUrl), true);
+		useUiStore.getState().setInspectorView(uiKey, "artifacts");
+		useUiStore.getState().setInspectorOpen(uiKey, true);
 		openSession(session);
 	}, [openSession, hostId]);
 
@@ -253,7 +264,6 @@ export function SessionsBoard({ projectId, hostId }: SessionsBoardProps) {
 					<div className="min-w-0 flex-1" />
 					{actions ? (
 						<div className="workspace-topbar-actions flex shrink-0 items-center" style={noDragStyle}>
-						<AwakeControl compact />
 							{actions}
 						</div>
 					) : null}
@@ -271,7 +281,10 @@ export function SessionsBoard({ projectId, hostId }: SessionsBoardProps) {
 
 			{/* Reserve only the collapsed archive bar. Expanded archive overlays the
 			    board so lane height (and Needs You scrollbars) stay stable. */}
-			<div className={cn("min-h-0 flex-1 overflow-hidden", hasArchive && archiveToggleOffsetClassName)}>
+			<div
+				className={cn("min-h-0 flex-1 overflow-hidden", hasArchive && archiveToggleOffsetClassName)}
+				style={hasArchive ? { clipPath: "inset(0 0 var(--sessions-archive-height, 58px) 0)" } : undefined}
+			>
 				{projectId && health.state !== "ok" && (!hostId || connected && (health.state !== "missing" || hasConfiguredOrchestratorAgent(workspace))) ? (
 					<div className="mx-3 my-3 flex items-center gap-3 rounded-md border border-border bg-surface px-3 py-2 text-xs text-muted-foreground">
 						<AlertTriangle className="size-icon-base shrink-0 text-warning" aria-hidden="true" />
@@ -317,10 +330,13 @@ export function SessionsBoard({ projectId, hostId }: SessionsBoardProps) {
 						labels={boardLabels}
 						renderSessionCard={(session) => (
 							<BoardSessionCardAdapter
+								participants={participantsBySession.get(session.id)}
+								me={cloudUserId}
 								memory={memoryBySession?.get(session.id)}
 								memoryTone={chipToneOf(session)}
 								onOpen={() => openSession(session)}
 								onOpenArtifact={(path) => openSessionArtifact(session, path)}
+								onOpenArtifacts={() => openSessionArtifacts(session)}
 								onTerminate={!hostId || connected ? ({ deleteArtifacts }) => terminateSession.mutate({ ...session, deleteArtifacts }) : undefined}
 								session={session}
 							/>
