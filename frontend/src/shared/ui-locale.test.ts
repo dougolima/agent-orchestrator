@@ -36,6 +36,7 @@ describe("shared UI locale schema", () => {
 		expect(DEFAULT_UI_SETTINGS).toEqual({
 			locale: "en",
 			soundNotificationsEnabled: true,
+			agentFinishedNotificationsEnabled: true,
 			terminalShell: { kind: "auto" },
 		});
 		expect(coerceUiSettings({ locale: "en", soundNotificationsEnabled: false })).toEqual({
@@ -45,6 +46,18 @@ describe("shared UI locale schema", () => {
 		expect(coerceUiSettings({ locale: "en", soundNotificationsEnabled: true })).toEqual({
 			...DEFAULT_UI_SETTINGS,
 			soundNotificationsEnabled: true,
+		});
+	});
+
+	it("defaults agentFinishedNotificationsEnabled to true and keeps a persisted boolean", () => {
+		expect(coerceUiSettings({ agentFinishedNotificationsEnabled: false })).toEqual({
+			...DEFAULT_UI_SETTINGS,
+			agentFinishedNotificationsEnabled: false,
+		});
+		expect(coerceUiSettings({ agentFinishedNotificationsEnabled: "false" })).toEqual(DEFAULT_UI_SETTINGS);
+		expect(coerceUiSettings({ soundNotificationsEnabled: false })).toEqual({
+			...DEFAULT_UI_SETTINGS,
+			soundNotificationsEnabled: false,
 		});
 	});
 

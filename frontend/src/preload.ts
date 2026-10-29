@@ -24,6 +24,7 @@ import {
 	type TrayAttentionState,
 	type TrayOpenSessionTarget,
 } from "./shared/tray";
+import { AGENT_FINISHED_CHANNEL, type AgentFinishedAlert } from "./shared/agent-finished";
 import type { DaemonStatus } from "./shared/daemon-status";
 import type { RemoteHostView } from "./main/remotes-ipc";
 import type { ConnectedHostView } from "./main/remote-registry";
@@ -627,6 +628,7 @@ const api = {
 	notifications: {
 		show: (notification: { id: string; title: string; body?: string; type?: string; watched?: boolean }) =>
 			ipcRenderer.invoke("notifications:show", notification) as Promise<void>,
+		agentFinished: (alert: AgentFinishedAlert) => ipcRenderer.send(AGENT_FINISHED_CHANNEL, alert),
 		setBadge: (count: number) => ipcRenderer.invoke("notifications:setBadge", count) as Promise<void>,
 		devBounce: () => ipcRenderer.invoke("notifications:devBounce") as Promise<void>,
 		onClick: (listener: (id: string) => void) => {

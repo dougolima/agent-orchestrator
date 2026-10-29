@@ -15,6 +15,7 @@ import { DaemonStartupLoader } from "../components/DaemonStartupLoader";
 import { NotificationRuntime } from "../components/NotificationCenter";
 import { HarnessUpdateNotice } from "../components/HarnessUpdateNotice";
 import { TrayRuntime } from "../components/TrayRuntime";
+import { AgentFinishedRuntime } from "../components/AgentFinishedRuntime";
 import { GlobalNewTaskDialog } from "../components/GlobalNewTaskDialog";
 import { GlobalToast } from "../components/GlobalToast";
 import { SettingsPane, SettingsProvider } from "../components/SettingsDialog";
@@ -1331,6 +1332,7 @@ function ShellLayout() {
 				<NotificationRuntime />
 				<HarnessUpdateNotice enabled={daemonStatus.state === "ready"} />
 				<TrayRuntime />
+				<AgentFinishedRuntime />
 				{isDragActive ? (
 					<div
 						aria-hidden="true"

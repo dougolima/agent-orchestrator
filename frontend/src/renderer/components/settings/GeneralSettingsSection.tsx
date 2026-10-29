@@ -4,6 +4,7 @@ import { previewDocumentThemeStyle, type ThemePreference, type ThemeStyle } from
 import { THEMES, getThemeDefinition } from "../../lib/theme-palettes";
 import type { AppLocale } from "../../i18n";
 import { useLocaleStore } from "../../stores/locale-store";
+import { useAgentFinishedNotificationsStore } from "../../stores/agent-finished-notifications-store";
 import { useSoundNotificationsStore } from "../../stores/sound-notifications-store";
 import { useUiStore } from "../../stores/ui-store";
 import { useTelemetryPolicyStore } from "../../stores/telemetry-policy-store";
@@ -137,6 +138,10 @@ export function GeneralSettingsSection({
 	const setSoundNotificationsEnabled = useSoundNotificationsStore((state) => state.setEnabled);
 	const soundNotificationsSaving = useSoundNotificationsStore((state) => state.saving);
 	const soundNotificationsSaveError = useSoundNotificationsStore((state) => state.saveError);
+	const agentFinishedEnabled = useAgentFinishedNotificationsStore((state) => state.enabled);
+	const setAgentFinishedEnabled = useAgentFinishedNotificationsStore((state) => state.setEnabled);
+	const agentFinishedSaving = useAgentFinishedNotificationsStore((state) => state.saving);
+	const agentFinishedSaveError = useAgentFinishedNotificationsStore((state) => state.saveError);
 	const developerMode = useUiStore((state) => state.developerMode);
 	const setDeveloperMode = useUiStore((state) => state.setDeveloperMode);
 	const terminalCopyOnSelect = useUiStore((state) => state.terminalCopyOnSelect);
@@ -230,6 +235,25 @@ export function GeneralSettingsSection({
 						disabled={soundNotificationsSaving}
 						onCheckedChange={(next) => {
 							void setSoundNotificationsEnabled(next);
+						}}
+					/>
+				</SettingsRow>
+				<SettingsRow
+					label={t("settings.agentFinishedNotifications")}
+					description={
+						agentFinishedSaveError ? (
+							<span role="alert" className="text-error">{t("settings.agentFinishedNotifications.saveFailed")}</span>
+						) : (
+							t("settings.agentFinishedNotifications.description")
+						)
+					}
+				>
+					<Switch
+						aria-label={t("settings.agentFinishedNotifications")}
+						checked={agentFinishedEnabled}
+						disabled={agentFinishedSaving}
+						onCheckedChange={(next) => {
+							void setAgentFinishedEnabled(next);
 						}}
 					/>
 				</SettingsRow>

@@ -61,7 +61,17 @@ describe("ui-settings", () => {
 		expect(await readUiSettings(dir)).toEqual({
 			locale: "ja",
 			soundNotificationsEnabled: false,
+			agentFinishedNotificationsEnabled: true,
 			terminalShell: { kind: "git-bash" },
+		});
+	});
+
+	it("keeps the agent finished preference independent of the sound toggle", async () => {
+		await writeUiSettings(dir, { agentFinishedNotificationsEnabled: false });
+		await writeUiSettings(dir, { soundNotificationsEnabled: false });
+		expect(await readUiSettings(dir)).toMatchObject({
+			soundNotificationsEnabled: false,
+			agentFinishedNotificationsEnabled: false,
 		});
 	});
 

@@ -174,6 +174,7 @@ vi.mock("../hooks/useWorkspaceQuery", () => ({
 	useWorkspacePolling: () => undefined,
 	useRemoteWorkspaces: () => ({ data: shellMocks.state.remoteWorkspaces, failedHostIds: shellMocks.state.remoteFailedHostIds, loadedProjectHostIds: [] }),
 	useWorkspaceTraySessions: () => ({ data: [] }),
+	useWorkspaceAgentActivity: () => ({ data: [] }),
 	workspaceQueryKey: ["workspaces"],
 	remoteWorkspaceQueryKey: (hostId: string) => ["remote-workspaces", hostId],
 	workspaceQueryOptions: {},

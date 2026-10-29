@@ -1,5 +1,6 @@
 import { useQueries, useQuery, useQueryClient, type Query } from "@tanstack/react-query";
 import type { TraySessionEntry } from "../../shared/tray";
+import type { AgentActivityEntry } from "../lib/agent-finished";
 import { useEffect, useMemo } from "react";
 import type { components } from "../../api/schema";
 import { apiClient, apiErrorCode, hasTrustedApiBaseUrl } from "../lib/api-client";
@@ -839,4 +840,33 @@ export function useWorkspaceTraySessions() {
 		return cloudEntries.length === 0 ? local.data : [...local.data, ...cloudEntries];
 	}, [cloudEntries, local.data]);
 	return { ...local, data };
+}
+
+function selectAgentActivity(workspaces: WorkspaceSummary[]): AgentActivityEntry[] {
+	const entries: AgentActivityEntry[] = [];
+	for (const workspace of workspaces) {
+		for (const session of workerSessions(workspace.sessions)) {
+			if (session.isTerminated) continue;
+			entries.push({
+				projectId: session.workspaceId,
+				projectName: workspace.name,
+				sessionId: session.id,
+				title: session.title,
+				state: session.activity?.state,
+			});
+		}
+	}
+	return entries;
+}
+
+/**
+ * Activity of every live local worker session, for the runtime that alerts
+ * when an agent finishes its turn. Orchestrators are left out: their turns are
+ * mostly reactions to worker reports, so alerting on each would be noise.
+ */
+export function useWorkspaceAgentActivity() {
+	return useQuery({
+		...workspaceQueryOptions,
+		select: selectAgentActivity,
+	});
 }

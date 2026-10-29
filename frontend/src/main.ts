@@ -100,6 +100,7 @@ import {
 	TRAY_RENDERER_READY_CHANNEL,
 	TRAY_SET_ATTENTION_STATE_CHANNEL,
 } from "./shared/tray";
+import { AGENT_FINISHED_CHANNEL, parseAgentFinishedAlert } from "./shared/agent-finished";
 import {
 	parseChatDraftBoundaryKinds,
 	parseChatDraftDialogCopy,
@@ -3082,6 +3083,28 @@ ipcMain.handle(
 ipcMain.on("notifications:soundFailed", (event) => {
 	if (event.sender !== getShellWebContents()) return;
 	shell.beep();
+});
+
+// A worker agent finished its turn while the user was not looking at that
+// session. The renderer owns that decision and the "Notify when an agent
+// finishes" preference; main plays the sound (subject to the global sound
+// toggle) and shows a toast that opens the session. No dock bounce or taskbar
+// flash: a finished turn is good to know, not something blocked on the user.
+ipcMain.on(AGENT_FINISHED_CHANNEL, (event, raw: unknown) => {
+	if (event.sender !== getShellWebContents() || !mainWindow) return;
+	const alert = parseAgentFinishedAlert(raw);
+	if (!alert) return;
+	const playsSound = soundNotificationsEnabled;
+	if (playsSound) playNotificationSound();
+	if (!ElectronNotification.isSupported()) return;
+	const toast = new ElectronNotification({
+		title: alert.title,
+		body: alert.body,
+		silent: toastSilent(process.platform, soundNotificationsEnabled, playsSound),
+		icon: process.platform === "darwin" ? undefined : windowIconPath(),
+	});
+	toast.on("click", () => trayLifecycle.openSession({ projectId: alert.projectId, sessionId: alert.sessionId }));
+	toast.show();
 });
 
 // Dev-only: force attention signal regardless of window focus (for testing)

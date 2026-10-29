@@ -18,6 +18,8 @@ export interface UiSettings {
 	locale: AppLocale;
 	/** Whether attention-worthy notifications (needs input, ready to merge) also play a sound. */
 	soundNotificationsEnabled: boolean;
+	/** Whether a worker agent finishing its turn alerts the user while they are not looking at that session. */
+	agentFinishedNotificationsEnabled: boolean;
 	/** Windows shell used for new standalone terminal panes. */
 	terminalShell: TerminalShellPreference;
 }
@@ -27,6 +29,7 @@ export const DEFAULT_TERMINAL_SHELL: TerminalShellPreference = { kind: "auto" };
 export const DEFAULT_UI_SETTINGS: UiSettings = {
 	locale: DEFAULT_LOCALE,
 	soundNotificationsEnabled: true,
+	agentFinishedNotificationsEnabled: true,
 	terminalShell: DEFAULT_TERMINAL_SHELL,
 };
 
@@ -58,9 +61,14 @@ export function coerceUiSettings(raw: unknown): UiSettings {
 		typeof record.soundNotificationsEnabled === "boolean"
 			? record.soundNotificationsEnabled
 			: DEFAULT_UI_SETTINGS.soundNotificationsEnabled;
+	const agentFinishedNotificationsEnabled =
+		typeof record.agentFinishedNotificationsEnabled === "boolean"
+			? record.agentFinishedNotificationsEnabled
+			: DEFAULT_UI_SETTINGS.agentFinishedNotificationsEnabled;
 	return {
 		locale: coerceLocale(record.locale),
 		soundNotificationsEnabled,
+		agentFinishedNotificationsEnabled,
 		terminalShell: coerceTerminalShell(record.terminalShell),
 	};
 }
