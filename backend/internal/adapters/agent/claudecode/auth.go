@@ -119,6 +119,16 @@ func (p *Plugin) AuthStatusWithDiagnostics(ctx context.Context) (ports.AgentAuth
 	return status, report.account(), steps, err
 }
 
+// AuthStatusForRuntime is AuthStatusWithDiagnostics for the credential a local
+// session launched from dataDir will actually use: with a setup-token login
+// chosen in AO, that token, which the native CLI check alone cannot see.
+func (p *Plugin) AuthStatusForRuntime(ctx context.Context, dataDir string) (ports.AgentAuthStatus, domain.AgentAccountIdentity, []domain.AgentAuthDiagnostic, error) {
+	env := make(map[string]string)
+	p.AugmentRuntimeEnv(env, dataDir)
+	status, report, steps, err := p.authStatusAndDiagnostics(ctx, "", env, false)
+	return status, report.account(), steps, err
+}
+
 // authStatusAndDiagnostics runs the ladder and also returns the CLI report
 // when it describes the credential the agent uses; otherwise the report is
 // empty.
@@ -346,6 +356,9 @@ var claudeNow = time.Now
 // InvalidateAuthCache drops the cached verdict. The runtime 401 handler calls
 // it: the provider has just contradicted whatever was stored.
 func InvalidateAuthCache() { claudeAuthCache.invalidate() }
+
+// InvalidateAuthCache implements ports.AgentAuthCacheInvalidator.
+func (p *Plugin) InvalidateAuthCache() { InvalidateAuthCache() }
 
 // claudeAuthReport is the parsed shape of `claude auth status --json`. Only
 // LoggedIn drives the verdict; the rest is diagnostics.

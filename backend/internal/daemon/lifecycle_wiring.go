@@ -23,6 +23,7 @@ import (
 	scratchworkspace "github.com/aoagents/agent-orchestrator/backend/internal/adapters/workspace/scratch"
 	"github.com/aoagents/agent-orchestrator/backend/internal/artifactversions"
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
+	"github.com/aoagents/agent-orchestrator/backend/internal/deliverytelemetry"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
 	activityobserver "github.com/aoagents/agent-orchestrator/backend/internal/observe/activity"
@@ -55,9 +56,9 @@ type lifecycleStack struct {
 	// service deletes artifacts through it so a delete holds the capture lock.
 	ArtifactVersions *artifactversions.Capturer
 	runtimeReaper    *reaper.Reaper
+	reaperStart      chan struct{}
+	reaperStartOnce  sync.Once
 	reaperDone       <-chan struct{}
-	reaperReady      chan struct{}
-	releaseOnce      sync.Once
 	activityDone     <-chan struct{}
 	turnFailureDone  <-chan struct{}
 	artifactsDone    <-chan struct{}
@@ -76,14 +77,17 @@ func startLifecycle(ctx context.Context, dataDir string, store *sqlite.Store, ru
 	lcm := lifecycle.New(store, messenger,
 		lifecycle.WithNotificationSink(notifier),
 		lifecycle.WithTelemetry(telemetry),
+		// One delivery recorder for every owner of a session end; services
+		// reach it through lcm.DeliveryTelemetry().
+		lifecycle.WithDeliveryTelemetry(deliverytelemetry.New(telemetry, store)),
 		lifecycle.WithContainerReaper(dockerreap.New(), store),
 		lifecycle.WithActiveSteering(activeTurnSteering(agents)),
 		lifecycle.WithStartupSignalGate(startupSignalGatesInput(agents)),
 		lifecycle.WithUrgentNudgeGate(urgentNudgeWaitingInputSafe(agents)),
 		lifecycle.WithDataDir(dataDir),
 	)
-	reaperReady := make(chan struct{})
-	rp := reaper.New(lcm, store, runtime, reaper.Config{Logger: logger, Ready: reaperReady})
+	reaperStart := make(chan struct{})
+	rp := reaper.New(lcm, store, runtime, reaper.Config{Logger: logger, StartAfter: reaperStart})
 	activityPoller := activityobserver.New(store, lcm, runtime, agents, activityobserver.Config{Logger: logger, DataDir: dataDir})
 	turnFailurePoller := activityobserver.NewTurnFailureObserver(store, lcm, agents, activityobserver.TurnFailureConfig{Logger: logger})
 	herdrServer, err := herdr.Start(ctx, dataDir, lcm, logger)
@@ -98,8 +102,8 @@ func startLifecycle(ctx context.Context, dataDir string, store *sqlite.Store, ru
 		LCM:              lcm,
 		ArtifactVersions: artifactVersions,
 		runtimeReaper:    rp,
+		reaperStart:      reaperStart,
 		reaperDone:       rp.Start(ctx),
-		reaperReady:      reaperReady,
 		activityDone:     activityPoller.Start(ctx),
 		turnFailureDone:  turnFailurePoller.Start(ctx),
 		herdr:            herdrServer,
@@ -147,16 +151,17 @@ func urgentNudgeWaitingInputSafe(agents ports.AgentResolver) func(domain.AgentHa
 
 // ReconcileRuntime runs the same conservative runtime/workload observation as
 // the periodic reaper. The daemon calls it after session-manager reconciliation
-// so exits missed while AO was stopped are folded before the API starts serving.
+// so exits missed while AO was stopped are folded after the startup check has
+// kept those sessions stopped and resumable. The periodic loop starts after it.
 func (l *lifecycleStack) ReconcileRuntime(ctx context.Context) error {
 	return l.runtimeReaper.Tick(ctx)
 }
 
-// ReleaseReaper starts the periodic reaper loop. The daemon calls it once boot
-// reconciliation has finished, so a session whose runtime died across the
-// restart is relaunched or preserved before the reaper may terminate it.
-func (l *lifecycleStack) ReleaseReaper() {
-	l.releaseOnce.Do(func() { close(l.reaperReady) })
+// StartReaperLoop lets the periodic reaper run. The boot goroutine defers it,
+// so it runs after ReconcileRuntime, and a panic before that pass cannot leave
+// the reaper off for good.
+func (l *lifecycleStack) StartReaperLoop() {
+	l.reaperStartOnce.Do(func() { close(l.reaperStart) })
 }
 
 // activeTurnSteering resolves the per-harness active-turn steering capability
@@ -213,15 +218,18 @@ func (l *lifecycleStack) Stop() {
 // depending on the concrete manager type.
 //
 // SaveAndTeardownAll is deliberately ABSENT from this interface so the daemon
-// cannot tear down live sessions on shutdown. Sessions survive the daemon exit
-// and Reconcile on the next boot adopts them, preserving session IDs. Re-adding
-// the method here is a visible, reviewable interface change.
+// cannot remove worktrees on shutdown. Explicit desktop quit may stop agent
+// processes; ordinary daemon replacement still preserves them for adoption.
 type sessionLifecycle interface {
 	Reconcile(ctx context.Context) error
 	ReconcileStartupSafety(ctx context.Context) error
 	ReconnectAwakeAgent(ctx context.Context, target domain.AwakeAgentTarget) error
 	ReconcileBackground(ctx context.Context) error
 	HibernateIdleChats(ctx context.Context) error
+	// ReconcileWorkspaceCleanup finishes interrupted workspace cleanups and
+	// records sessions with nothing left on disk; it never deletes a worktree
+	// the user has not asked to remove.
+	ReconcileWorkspaceCleanup(ctx context.Context) error
 	RefreshStaleChats(ctx context.Context, minIdle time.Duration) error
 	RefreshStaleTerminals(ctx context.Context, minIdle time.Duration) error
 	BusyHarnessSessions(ctx context.Context, harness domain.AgentHarness) ([]domain.SessionWait, error)
@@ -229,6 +237,7 @@ type sessionLifecycle interface {
 	ResumeHarnessSessions(ctx context.Context, ids []domain.SessionID) error
 	SetVersionTelemetry(sink ports.EventSink)
 	SetVersionRefreshPolicy(policy func() sessionmanager.VersionRefreshPolicy)
+	SetComputerUseEnabled(enabled func(context.Context) bool)
 	RetryVersionMoves(ctx context.Context) error
 	ObserveChatVersionSwitch(id domain.SessionID, version, result string)
 	MarkHarnessUpdated(ctx context.Context, harness domain.AgentHarness, version string, at time.Time) error
@@ -236,6 +245,7 @@ type sessionLifecycle interface {
 	RestoreAll(ctx context.Context) error
 	WaitBackgroundWorkers(ctx context.Context) error
 	WaitAgentSwitchWorkers(ctx context.Context) error
+	StopAgentsForQuit(ctx context.Context) error
 	Kill(ctx context.Context, id domain.SessionID) (bool, error)
 	Send(ctx context.Context, id domain.SessionID, message string, attachment *ports.SpawnAttachment) error
 	// SetShellTerminalCloser late-binds Kill/Cleanup to close a session's
@@ -297,7 +307,7 @@ func telemetryEmitsSpawned(cfg config.Config) bool {
 // (issue #2685). The returned service is mounted at httpd APIDeps.Sessions.
 // It also returns the manager so the caller can wire Reconcile into the boot
 // sequence.
-func startSession(ctx context.Context, cfg config.Config, runtime runtimeselect.Runtime, store *sqlite.Store, lcm *lifecycle.Manager, artifactVersions *artifactversions.Capturer, messenger ports.AgentMessenger, telemetry ports.EventSink, notifications notificationSink, agents ports.AgentResolver, agentReadiness ports.AgentReadinessProvider, previewLifecycle sessionmanager.PreviewLifecycle, browserLifecycle sessionmanager.BrowserLifecycle, browserCapabilities sessionmanager.BrowserCapabilityIssuer, chat sessionmanager.ChatLauncher, reviewerRecoveryDone <-chan struct{}, defaults sessionmanager.SessionModeDefaults, tracker ports.Tracker, codexOperationGate ports.CodexOperationGate, reviewers *reviewer.Resolver, log *slog.Logger) (*sessionsvc.Service, reviewsvc.Manager, sessionLifecycle, error) {
+func startSession(ctx context.Context, cfg config.Config, runtime runtimeselect.Runtime, store *sqlite.Store, lcm *lifecycle.Manager, artifactVersions *artifactversions.Capturer, messenger ports.AgentMessenger, telemetry ports.EventSink, notifications notificationSink, agents ports.AgentResolver, agentReadiness ports.AgentReadinessProvider, previewLifecycle sessionmanager.PreviewLifecycle, browserLifecycle sessionmanager.BrowserLifecycle, browserCapabilities sessionmanager.BrowserCapabilityIssuer, chat sessionmanager.ChatLauncher, reviewerRecoveryDone <-chan struct{}, defaults sessionmanager.SessionModeDefaults, tracker ports.Tracker, codexOperationGate ports.CodexOperationGate, reviewers *reviewer.Resolver, reviewRefresher reviewsvc.ThreadRefresher, log *slog.Logger) (*sessionsvc.Service, reviewsvc.Manager, sessionLifecycle, error) {
 	gitWS, err := gitworktree.New(gitworktree.Options{
 		// Per-session worktrees live under the data dir, so a single AO_DATA_DIR
 		// override moves all durable per-user state together.
@@ -361,6 +371,8 @@ func startSession(ctx context.Context, cfg config.Config, runtime runtimeselect.
 		DataDir:           cfg.DataDir,
 		Tracker:           tracker,
 		Telemetry:         telemetry,
+		Milestones:        installMilestones(cfg),
+		Delivery:          lcm.DeliveryTelemetry(),
 		Logger:            log,
 		BackgroundContext: ctx,
 		AgentReadiness:    agentReadiness,
@@ -407,6 +419,9 @@ func startSession(ctx context.Context, cfg config.Config, runtime runtimeselect.
 		)
 	}
 	reviewOpts = append(reviewOpts, reviewsvc.WithPRRefresher(reviewPRRefresher{sessions: sessionSvc}))
+	if reviewRefresher != nil {
+		reviewOpts = append(reviewOpts, reviewsvc.WithThreadRefresher(reviewRefresher))
+	}
 	reviewSvc := reviewsvc.New(reviewEngine, store, reviewOpts...)
 	mgr.SetReviewerTerminator(reviewSvc)
 	return sessionSvc, reviewSvc, mgr, nil
@@ -731,6 +746,10 @@ func (c chatLauncher) SupportsChat(harness domain.AgentHarness) bool {
 	return c.svc.SupportsChat(harness)
 }
 
+func (c chatLauncher) PermissionModes(ctx context.Context, harness domain.AgentHarness) ([]ports.PermissionMode, error) {
+	return c.svc.PermissionModes(ctx, harness)
+}
+
 func (c chatLauncher) PreflightChat(
 	ctx context.Context,
 	harness domain.AgentHarness,
@@ -820,7 +839,8 @@ func (c chatLauncher) RelaySessionChatTurn(ctx context.Context, id domain.Sessio
 
 func (c chatLauncher) QueueChatPrompt(ctx context.Context, id domain.SessionID, text string) (string, error) {
 	turn, err := c.svc.QueueUserMessage(ctx, id, ports.ChatUserMessage{
-		Text: text,
+		Text:               text,
+		SpawnOpeningPrompt: true,
 		// The opening prompt is the user's own task brief, whatever carries it.
 		Origin: domain.MessageOriginHuman,
 	})
@@ -906,7 +926,13 @@ func (c chatLauncher) StopChat(ctx context.Context, id domain.SessionID) error {
 type reviewPRRefresher struct {
 	sessions interface {
 		ClaimPR(ctx context.Context, id domain.SessionID, ref string, opts sessionsvc.ClaimPROptions) (sessionsvc.ClaimPRResult, error)
+		FindBranchPRs(ctx context.Context, id domain.SessionID) (sessionsvc.BranchPRs, error)
 	}
+}
+
+func (r reviewPRRefresher) FindBranchPRs(ctx context.Context, workerID domain.SessionID) (reviewsvc.BranchPRs, error) {
+	found, err := r.sessions.FindBranchPRs(ctx, workerID)
+	return reviewsvc.BranchPRs{Own: found.Own, OtherAuthor: found.OtherAuthor}, err
 }
 
 func (r reviewPRRefresher) RefreshPR(ctx context.Context, workerID domain.SessionID, prURL string) error {

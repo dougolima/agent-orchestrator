@@ -669,7 +669,8 @@ func insertAndActivateConversationBranchTx(ctx context.Context, q *gen.Queries, 
 	if rows != 1 {
 		return fmt.Errorf("move conversation head: conversation %s not found", branch.ConversationID)
 	}
-	return nil
+	// An edited branch's path drops the copies written after its fork.
+	return reconcileSpanningPlans(ctx, q, branch.ConversationID, now)
 }
 
 // CommitChatSpawn publishes a reserved fresh-provider boundary and the complete
@@ -1015,6 +1016,10 @@ func (s *Store) RepairIncompleteConversationEdit(
 		if conversationRows != 1 {
 			return fmt.Errorf("restore source conversation head: conversation %s not found", conversationID)
 		}
+		// The source path holds the copies written after the abandoned fork again.
+		if reconcileErr := reconcileSpanningPlans(ctx, q, conversationID, now); reconcileErr != nil {
+			return reconcileErr
+		}
 		parent.Active = true
 		repaired = parent
 		if active.SessionID != sessionID {
@@ -1106,7 +1111,8 @@ func (s *Store) ActivateConversationBranch(
 		if sessionRows != 1 {
 			return fmt.Errorf("move session controller: live chat session %s not found", sessionID)
 		}
-		return nil
+		// The new path holds its own copies of a list that spans turns.
+		return reconcileSpanningPlans(ctx, q, conversationID, now)
 	})
 }
 
@@ -1422,6 +1428,7 @@ func (s *Store) appendUserMessage(
 			ClientPayloadHash:   sql.NullString{String: msg.ClientPayloadHash, Valid: msg.ClientPayloadHash != ""},
 			DeliveryContentJson: msg.DeliveryContentJSON,
 			Continuation:        boolInt(msg.Continuation),
+			AuthoredByUser:      boolInt(msg.AuthoredByUser),
 			SenderSessionID:     msg.SenderSessionID,
 			SenderProjectID:     msg.SenderProjectID,
 			SenderDisplayName:   msg.SenderDisplayName,
@@ -1429,6 +1436,12 @@ func (s *Store) appendUserMessage(
 			UpdatedAt:           now,
 		}); err != nil {
 			return err
+		}
+		if retryOfTurnID == "" && reviewID == "" && !msg.SpawnOpeningPrompt && msg.Origin == domain.MessageOriginHuman &&
+			msg.SenderSessionID == "" && s.usageAllowed() {
+			if err := q.IncrementUsageMessageSummary(ctx, usageMessageIncrement(ctx, session, usageMessageChat, now)); err != nil {
+				return fmt.Errorf("record usage message count: %w", err)
+			}
 		}
 		interactionAt := msg.InteractionAt
 		if interactionAt.IsZero() {
@@ -1610,6 +1623,27 @@ func (s *Store) MarkTurnDispatching(ctx context.Context, turnID string) error {
 	return nil
 }
 
+// RecordProviderInput saves the exact combined text for native replay. A normal
+// send records it before provider I/O; an accepted steer records it afterward.
+func (s *Store) RecordProviderInput(ctx context.Context, turnID, text string) error {
+	q, unlock := s.conversationWriter(ctx)
+	defer unlock()
+	rows, err := q.SetConversationProviderInputText(ctx, gen.SetConversationProviderInputTextParams{
+		ProviderInputText: text, ID: turnID,
+	})
+	return expectBatchRow("record provider input", turnID, rows, err)
+}
+
+func expectBatchRow(action, id string, rows int64, err error) error {
+	if err != nil {
+		return fmt.Errorf("%s %s: %w", action, id, err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("%s %s: expected one row, got %d", action, id, rows)
+	}
+	return nil
+}
+
 // BindTurnToProvider records the provider's turn id once a send is accepted and
 // marks the turn running.
 func (s *Store) BindTurnToProvider(ctx context.Context, turnID, providerTurnID string, now time.Time) error {
@@ -1640,6 +1674,19 @@ func (s *Store) SettleTurn(
 	errMessage string,
 	now time.Time,
 ) error {
+	return s.SettleTurnWithFailureCode(ctx, conversationID, providerTurnID, state, errMessage, "", now)
+}
+
+// SettleTurnWithFailureCode retains a provider-classified cause beside the raw
+// error so recovery guidance survives a daemon or desktop restart.
+func (s *Store) SettleTurnWithFailureCode(
+	ctx context.Context,
+	conversationID, providerTurnID string,
+	state domain.TurnState,
+	errMessage string,
+	failureCode domain.ConversationFailureCode,
+	now time.Time,
+) error {
 	q, unlock := s.conversationWriter(ctx)
 	defer unlock()
 
@@ -1656,10 +1703,22 @@ func (s *Store) SettleTurn(
 	if err != nil {
 		return fmt.Errorf("select turn %s: %w", providerTurnID, err)
 	}
+	// A history replay re-settles a turn without its error, which is not
+	// portable. Keep the live reason: a usage limit is classified from it.
+	// A resumed Codex thread also replays a turn AO already failed as interrupted.
+	// The stored failure is what happened; nobody interrupted that turn.
+	if errMessage == "" && state == domain.TurnStateInterrupted &&
+		turn.State == domain.TurnStateFailed && turn.ErrorMessage != "" {
+		state = domain.TurnStateFailed
+	}
+	if errMessage == "" && turn.State == state {
+		errMessage = turn.ErrorMessage
+	}
 
 	if err := q.SettleConversationTurn(ctx, gen.SettleConversationTurnParams{
 		State:        state,
 		ErrorMessage: errMessage,
+		FailureCode:  string(failureCode),
 		CompletedAt:  sql.NullTime{Time: now, Valid: true},
 		ID:           turn.ID,
 	}); err != nil {
@@ -2214,18 +2273,70 @@ func (s *Store) ReconcileConversationAuthentication(ctx context.Context, convers
 	if account.AuthVerifiedAt != nil && !turn.CompletedAt.Time.After(*account.AuthVerifiedAt) && account.ReauthRequiredAt == nil {
 		return account, nil
 	}
+	markAuthenticated(account, turn.CompletedAt.Time)
+	if err := s.RecordAccount(ctx, conversationID, *account, now); err != nil {
+		return nil, err
+	}
+	return account, nil
+}
+
+// ConversationAwaitingLogin is a session conversation whose provider asked for
+// credentials, and the harness its session runs.
+type ConversationAwaitingLogin struct {
+	ConversationID string
+	SessionID      domain.SessionID
+	Harness        domain.AgentHarness
+}
+
+// ConversationsAwaitingLogin lists session conversations with an unanswered
+// credential demand.
+func (s *Store) ConversationsAwaitingLogin(ctx context.Context) ([]ConversationAwaitingLogin, error) {
+	rows, err := s.qr.SelectConversationsAwaitingLogin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ConversationAwaitingLogin, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, ConversationAwaitingLogin(row))
+	}
+	return out, nil
+}
+
+// ConfirmConversationLogin clears a credential demand that a later check of the
+// session's account answered: at is when a check began that found the account
+// signed in and read its limits from the provider with that login. A demand
+// recorded at or after at stays, since that check cannot speak for it.
+func (s *Store) ConfirmConversationLogin(ctx context.Context, conversationID string, at, now time.Time) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	cleared := false
+	err := s.inTx(ctx, "confirm conversation login", func(q *gen.Queries) error {
+		row, err := q.SelectConversationByID(ctx, conversationID)
+		if err != nil {
+			return err
+		}
+		account := conversationToDomain(row).Account
+		if account == nil || account.ReauthRequiredAt == nil || !account.ReauthRequiredAt.Before(at) {
+			return nil
+		}
+		markAuthenticated(account, at)
+		cleared = true
+		return s.RecordAccount(context.WithValue(ctx, conversationProjectionTxKey{}, q), conversationID, *account, now)
+	})
+	return cleared && err == nil, err
+}
+
+// markAuthenticated records provider success at verifiedAt. A demand it
+// answers is kept as the last failure.
+func markAuthenticated(account *domain.ConversationAccount, verifiedAt time.Time) {
 	if account.ReauthRequiredAt != nil && account.LastAuthFailureAt == nil {
 		account.LastAuthFailureAt = account.ReauthRequiredAt
 		account.LastAuthFailureReason = account.ReauthReason
 	}
 	account.AuthenticationState = "authenticated"
-	account.AuthVerifiedAt = &turn.CompletedAt.Time
+	account.AuthVerifiedAt = &verifiedAt
 	account.ReauthRequiredAt = nil
 	account.ReauthReason = ""
-	if err := s.RecordAccount(ctx, conversationID, *account, now); err != nil {
-		return nil, err
-	}
-	return account, nil
 }
 
 // RecordThreadState stores the provider's lifecycle view of the thread.
@@ -2316,6 +2427,70 @@ func (s *Store) SetTurnPlan(
 		return false, fmt.Errorf("set turn plan for %s: %w", providerTurnID, err)
 	}
 	return rows > 0, nil
+}
+
+// ReconcileSpanningPlans marks which copy of a list that spans turns is current
+// on the conversation's active path: the copy written last. Every other copy on
+// the path is superseded. Copies on other branches keep their marks until their
+// branch is active again, when this runs for that path.
+func (s *Store) ReconcileSpanningPlans(ctx context.Context, conversationID string, now time.Time) error {
+	q, unlock := s.conversationWriter(ctx)
+	defer unlock()
+	return reconcileSpanningPlans(ctx, q, conversationID, now)
+}
+
+func reconcileSpanningPlans(ctx context.Context, q *gen.Queries, conversationID string, now time.Time) error {
+	copies, err := q.SelectSpanningPlanCopiesOnActivePath(ctx, conversationID)
+	if err != nil {
+		return fmt.Errorf("select spanning plan copies in %s: %w", conversationID, err)
+	}
+	current := -1
+	var currentAt time.Time
+	for index, planCopy := range copies {
+		at := spanningPlanWrittenAt(planCopy)
+		// Rows come in sequence order, so a tie goes to the later row.
+		if current < 0 || !at.Before(currentAt) {
+			current, currentAt = index, at
+		}
+	}
+	for index, planCopy := range copies {
+		superseded := index != current
+		if err := q.SetConversationPlanActivitySuperseded(ctx, gen.SetConversationPlanActivitySupersededParams{
+			Superseded: superseded,
+			UpdatedAt:  now,
+			ID:         planCopy.ID,
+		}); err != nil {
+			return fmt.Errorf("mark plan row %s: %w", planCopy.ID, err)
+		}
+		// A turn's plan and its plan row are one planCopy, written from one event.
+		if planCopy.TurnID.Valid {
+			if err := q.SetConversationTurnPlanSuperseded(ctx, gen.SetConversationTurnPlanSupersededParams{
+				Superseded: superseded,
+				ID:         planCopy.TurnID.String,
+			}); err != nil {
+				return fmt.Errorf("mark turn plan %s: %w", planCopy.TurnID.String, err)
+			}
+		}
+	}
+	return nil
+}
+
+// spanningPlanWrittenAt is when a planCopy's content was last written. The daemon
+// records it on each write. A planCopy from before that is dated as the upgrade
+// migration dates it: a turnless row was one revision, written when created,
+// and a turn's planCopy could change only until its turn ended. The row's updated_at
+// is no guide, since settling and recovery touch rows they do not rewrite.
+func spanningPlanWrittenAt(planCopy gen.SelectSpanningPlanCopiesOnActivePathRow) time.Time {
+	var detail struct {
+		WrittenAt time.Time `json:"writtenAt"`
+	}
+	if json.Unmarshal([]byte(planCopy.DetailJson), &detail) == nil && !detail.WrittenAt.IsZero() {
+		return detail.WrittenAt
+	}
+	if planCopy.TurnID.Valid && planCopy.TurnCompletedAt.Valid {
+		return planCopy.TurnCompletedAt.Time
+	}
+	return planCopy.CreatedAt
 }
 
 // MaxStreamedTextChars caps the provider prose stored for one activity.
@@ -2421,7 +2596,149 @@ func (s *Store) NextQueuedTurn(ctx context.Context, conversationID string) (doma
 		ClientMessageID:     row.ClientMessageID,
 		Origin:              row.Origin,
 		DeliveryContentJSON: row.DeliveryContentJson,
+		SenderSessionID:     row.SenderSessionID,
+		SenderProjectID:     row.SenderProjectID,
+		SenderDisplayName:   row.SenderDisplayName,
 	}, nil
+}
+
+// ListQueuedBatch previews the current queue without reserving any message.
+func (s *Store) ListQueuedBatch(ctx context.Context, conversationID string, limit int) ([]domain.QueuedTurn, error) {
+	rows, err := s.qr.SelectQueuedConversationBatch(ctx, conversationID)
+	if err != nil {
+		return nil, fmt.Errorf("list queued batch: %w", err)
+	}
+	if limit > 0 && len(rows) > limit {
+		rows = rows[:limit]
+	}
+	if len(rows) == 0 {
+		return nil, domain.ErrNoQueuedTurn
+	}
+	batch := make([]domain.QueuedTurn, 0, len(rows))
+	for _, row := range rows {
+		batch = append(batch, domain.QueuedTurn{
+			TurnID: row.ID, Text: row.Text, ClientMessageID: row.ClientMessageID,
+			Origin: row.Origin, DeliveryContentJSON: row.DeliveryContentJson,
+			SenderSessionID: row.SenderSessionID, SenderProjectID: row.SenderProjectID,
+			SenderDisplayName: row.SenderDisplayName,
+		})
+	}
+	return batch, nil
+}
+
+// ClaimQueuedBatch fixes one delivery boundary before provider I/O. The first
+// row becomes the provider turn for a normal drain. Other rows are reserved as
+// members of that input. A steer reserves every row without starting a new turn.
+func (s *Store) ClaimQueuedBatch(ctx context.Context, conversationID string, dispatch bool, limit int, now time.Time) ([]domain.QueuedTurn, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	var batch []domain.QueuedTurn
+	err := s.inTx(ctx, "claim queued batch", func(q *gen.Queries) error {
+		rows, err := q.SelectQueuedConversationBatch(ctx, conversationID)
+		if err != nil {
+			return err
+		}
+		if limit > 0 && len(rows) > limit {
+			rows = rows[:limit]
+		}
+		for _, row := range rows {
+			changed, err := q.ReserveQueuedConversationTurnForPromotion(ctx, gen.ReserveQueuedConversationTurnForPromotionParams{
+				PromotionStartedAt: sql.NullTime{Time: now, Valid: true}, ID: row.ID, ConversationID: conversationID,
+			})
+			if checkErr := expectBatchRow("reserve queued batch turn", row.ID, changed, err); checkErr != nil {
+				return checkErr
+			}
+			batch = append(batch, domain.QueuedTurn{
+				TurnID: row.ID, Text: row.Text, ClientMessageID: row.ClientMessageID,
+				Origin: row.Origin, DeliveryContentJSON: row.DeliveryContentJson,
+				SenderSessionID: row.SenderSessionID, SenderProjectID: row.SenderProjectID,
+				SenderDisplayName: row.SenderDisplayName,
+			})
+		}
+		if dispatch && len(batch) > 0 {
+			if err := q.MarkConversationTurnStarted(ctx, gen.MarkConversationTurnStartedParams{ID: batch[0].TurnID}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("claim queued batch: %w", err)
+	}
+	if len(batch) == 0 {
+		return nil, domain.ErrNoQueuedTurn
+	}
+	return batch, nil
+}
+
+// CompleteQueuedBatch links each source receipt to the provider turn that took
+// its input. The original messages keep their own transcript metadata.
+func (s *Store) CompleteQueuedBatch(ctx context.Context, conversationID string, turnIDs []string, providerTurnID string, now time.Time) error {
+	if len(turnIDs) == 0 {
+		return nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.inTx(ctx, "complete queued batch", func(q *gen.Queries) error {
+		target, err := q.SelectConversationTurnByProviderID(ctx, gen.SelectConversationTurnByProviderIDParams{
+			ConversationID: conversationID, ProviderTurnID: providerTurnID,
+		})
+		if err != nil {
+			return err
+		}
+		for _, id := range turnIDs {
+			changed, err := q.CompleteQueuedConversationBatchMember(ctx, gen.CompleteQueuedConversationBatchMemberParams{
+				CompletedAt:      sql.NullTime{Time: now, Valid: true},
+				PromotedToTurnID: sql.NullString{String: target.ID, Valid: true},
+				ID:               id, ConversationID: conversationID,
+			})
+			if checkErr := expectBatchRow("complete queued batch turn", id, changed, err); checkErr != nil {
+				return checkErr
+			}
+		}
+		return nil
+	})
+}
+
+// ReleaseQueuedBatch returns a definitively refused steer batch to its queue.
+func (s *Store) ReleaseQueuedBatch(ctx context.Context, conversationID string, turnIDs []string) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.inTx(ctx, "release queued batch", func(q *gen.Queries) error {
+		for _, id := range turnIDs {
+			changed, err := q.ReleaseQueuedConversationTurnPromotion(ctx, gen.ReleaseQueuedConversationTurnPromotionParams{ID: id, ConversationID: conversationID})
+			if checkErr := expectBatchRow("release queued batch turn", id, changed, err); checkErr != nil {
+				return checkErr
+			}
+		}
+		return nil
+	})
+}
+
+// FailQueuedBatch retains uncertain source messages without replaying them.
+func (s *Store) FailQueuedBatch(ctx context.Context, conversationID string, turnIDs []string, reason string, now time.Time) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.inTx(ctx, "fail queued batch", func(q *gen.Queries) error {
+		for _, id := range turnIDs {
+			if err := q.SettleConversationTurn(ctx, gen.SettleConversationTurnParams{
+				State: domain.TurnStateFailed, ErrorMessage: reason,
+				CompletedAt: sql.NullTime{Time: now, Valid: true}, ID: id,
+			}); err != nil {
+				return fmt.Errorf("fail queued batch turn %s: %w", id, err)
+			}
+		}
+		return nil
+	})
+}
+
+// FailReservedQueuedBatch closes stranded reservations during live reconnect.
+func (s *Store) FailReservedQueuedBatch(ctx context.Context, conversationID string, now time.Time) error {
+	q, unlock := s.conversationWriter(ctx)
+	defer unlock()
+	return q.FailReservedQueuedConversationTurns(ctx, gen.FailReservedQueuedConversationTurnsParams{
+		CompletedAt: sql.NullTime{Time: now, Valid: true}, ConversationID: conversationID,
+	})
 }
 
 // ReserveQueuedTurnForPromotion atomically removes one selected queued turn from
@@ -2454,7 +2771,8 @@ func (s *Store) ReserveQueuedTurnForPromotion(
 	}
 	return domain.QueuedTurn{
 		TurnID: row.ID, Text: row.Text, ClientMessageID: row.ClientMessageID,
-		Origin: row.Origin, DeliveryContentJSON: row.DeliveryContentJson,
+		Origin: row.Origin, AuthoredByUser: row.AuthoredByUser != 0,
+		DeliveryContentJSON: row.DeliveryContentJson,
 	}, nil
 }
 
@@ -2735,6 +3053,7 @@ func (s *Store) SettleTurnByID(
 	if err := s.qw.SettleConversationTurn(ctx, gen.SettleConversationTurnParams{
 		State:        state,
 		ErrorMessage: errMessage,
+		FailureCode:  "",
 		CompletedAt:  sql.NullTime{Time: now, Valid: true},
 		ID:           turnID,
 	}); err != nil {
@@ -3394,7 +3713,7 @@ func (s *Store) RollbackTurns(
 			gen.MarkConversationTurnsRolledBackParams{
 				RolledBackAt:   sql.NullTime{Time: now, Valid: true},
 				ConversationID: conversationID,
-				ID:             turnID,
+				AnchorTurnID:   turnID,
 			})
 		if markErr != nil {
 			return fmt.Errorf("mark turns rolled back: %w", markErr)
@@ -3434,7 +3753,8 @@ func (s *Store) RollbackTurns(
 			}); err != nil {
 			return fmt.Errorf("fail rolled back approvals: %w", err)
 		}
-		return nil
+		// A rolled-back turn's copy of a list that spans turns is no longer current.
+		return reconcileSpanningPlans(ctx, q, conversationID, now)
 	})
 	if err != nil {
 		return 0, err
@@ -3577,7 +3897,8 @@ func (r *conversationPageRows[T]) at(index int, before, visibleAfter int64) (*T,
 		if err != nil {
 			return nil, err
 		}
-		r.done = int64(len(chunk)) < r.chunk
+		// A byte-bounded fetch can be shorter than the row limit without reaching EOF.
+		r.done = len(chunk) == 0
 		for _, row := range chunk {
 			if r.sequence(row) <= visibleAfter {
 				r.done = true
@@ -3684,7 +4005,7 @@ func (s *Store) conversationPage(
 			sequence: func(row gen.ConversationMessage) int64 { return row.Sequence },
 			read: func(before, n int64) ([]gen.ConversationMessage, error) {
 				rows, err := s.qr.SelectConversationMessagesPage(ctx, gen.SelectConversationMessagesPageParams{
-					ConversationID: conversationID, BeforeSequence: before, PageLimit: n,
+					ConversationID: conversationID, BeforeSequence: before, PageLimit: n, PageBytes: conversationPageMaxBytes,
 				})
 				if err != nil {
 					return nil, fmt.Errorf("select message page: %w", err)
@@ -3697,7 +4018,7 @@ func (s *Store) conversationPage(
 			sequence: func(row gen.ConversationActivity) int64 { return row.Sequence },
 			read: func(before, n int64) ([]gen.ConversationActivity, error) {
 				rows, err := s.qr.SelectConversationActivitiesPage(ctx, gen.SelectConversationActivitiesPageParams{
-					ConversationID: conversationID, BeforeSequence: before, PageLimit: n,
+					ConversationID: conversationID, BeforeSequence: before, PageLimit: n, PageBytes: conversationPageMaxBytes,
 				})
 				if err != nil {
 					return nil, fmt.Errorf("select activity page: %w", err)
@@ -4376,8 +4697,10 @@ func turnToDomain(row gen.ConversationTurn) domain.ConversationTurn {
 		BranchID:           row.BranchID,
 		HandledBySessionID: row.HandledBySessionID,
 		ProviderTurnID:     row.ProviderTurnID,
+		ProviderInputText:  row.ProviderInputText,
 		State:              row.State,
 		ErrorMessage:       row.ErrorMessage,
+		FailureCode:        domain.ConversationFailureCode(row.FailureCode),
 		RequestedAt:        row.RequestedAt,
 	}
 	if row.RetryOfTurnID.Valid {
@@ -4442,6 +4765,7 @@ func messageToDomain(row gen.ConversationMessage) domain.ConversationMessage {
 		ClientPayloadHash:   row.ClientPayloadHash.String,
 		DeliveryContentJSON: row.DeliveryContentJson,
 		Continuation:        row.Continuation != 0,
+		AuthoredByUser:      row.AuthoredByUser != 0,
 		SenderSessionID:     row.SenderSessionID,
 		SenderProjectID:     row.SenderProjectID,
 		SenderDisplayName:   row.SenderDisplayName,
@@ -4502,6 +4826,22 @@ func (s *Store) ProviderEventsSince(
 	return rows, nil
 }
 
+type steerRetryInput struct {
+	Text                       string              `json:"text"`
+	Content                    []ports.ChatContent `json:"content"`
+	ProviderInputText          string              `json:"providerInputText"`
+	ProviderInputContent       []ports.ChatContent `json:"providerInputContent"`
+	ProviderInputCaptured      bool                `json:"providerInputCaptured"`
+	ProviderInputStoredOnTurn  bool                `json:"providerInputStoredOnTurn"`
+	ProviderInputSourceTurnIDs []string            `json:"providerInputSourceTurnIds"`
+}
+
+type retryProviderInputItem struct {
+	Text         string `json:"text"`
+	ContentStart int    `json:"contentStart,omitempty"`
+	ContentCount int    `json:"contentCount,omitempty"`
+}
+
 // RetryPrompt returns the durable human prompt of a failed turn, for
 // re-dispatching it as a new turn. The content is loaded from AO's own rows
 // rather than from a client request that could be stale or substituted.
@@ -4515,13 +4855,101 @@ func (s *Store) RetryPrompt(ctx context.Context, conversationID, turnID string) 
 	if err != nil {
 		return domain.RetryPrompt{}, fmt.Errorf("read retry prompt %s: %w", turnID, err)
 	}
-	return domain.RetryPrompt{
+	prompt := domain.RetryPrompt{
 		Continuation:        row.Continuation != 0,
 		Text:                row.Text,
+		ProviderInputText:   row.ProviderInputText,
 		Origin:              row.Origin,
 		DeliveryContentJSON: row.DeliveryContentJson,
 		ActiveLineage:       row.ActiveLineage,
-	}, nil
+	}
+	activityDetails, err := s.qr.SelectConversationSteerRetryInputs(ctx, gen.SelectConversationSteerRetryInputsParams{
+		ConversationID: conversationID, TurnID: sql.NullString{String: turnID, Valid: true},
+	})
+	if err != nil {
+		return domain.RetryPrompt{}, fmt.Errorf("read steer inputs %s: %w", turnID, err)
+	}
+	if prompt.ProviderInputText == "" && len(activityDetails) == 0 {
+		return prompt, nil
+	}
+	steers := make([]steerRetryInput, 0, len(activityDetails))
+	steeredSourceIDs := make(map[string]bool)
+	initialText := prompt.Text
+	initialWasRendered := prompt.ProviderInputText != ""
+	if initialWasRendered {
+		initialText = prompt.ProviderInputText
+	}
+	for _, detail := range activityDetails {
+		var steer steerRetryInput
+		if err := json.Unmarshal([]byte(detail), &steer); err != nil {
+			return domain.RetryPrompt{}, fmt.Errorf("decode steer input %s: %w", turnID, err)
+		}
+		if steer.ProviderInputStoredOnTurn && steer.ProviderInputText == prompt.ProviderInputText {
+			// Older turns could save the first batch steer in this field instead of
+			// the opening input. Its activity still identifies that steer.
+			initialText = prompt.Text
+			initialWasRendered = false
+		}
+		if steer.ProviderInputCaptured {
+			for _, id := range steer.ProviderInputSourceTurnIDs {
+				steeredSourceIDs[id] = true
+			}
+		}
+		steers = append(steers, steer)
+	}
+	blocks, err := s.qr.SelectConversationProviderInputContent(ctx, gen.SelectConversationProviderInputContentParams{
+		ConversationID: conversationID, TurnID: turnID,
+	})
+	if err != nil {
+		return domain.RetryPrompt{}, fmt.Errorf("read provider input content %s: %w", turnID, err)
+	}
+	var content []ports.ChatContent
+	for _, block := range blocks {
+		if steeredSourceIDs[block.SourceTurnID] || block.DeliveryContentJson == "" {
+			continue
+		}
+		var items []ports.ChatContent
+		if err := json.Unmarshal([]byte(block.DeliveryContentJson), &items); err != nil {
+			return domain.RetryPrompt{}, fmt.Errorf("decode provider input content %s: %w", turnID, err)
+		}
+		for _, item := range items {
+			if initialWasRendered && ((item.Type == "excerpt" && item.Excerpt != nil) || (item.Type == "text" && item.Internal)) {
+				continue
+			}
+			content = append(content, item)
+		}
+	}
+	if len(steers) > 0 {
+		inputs := []retryProviderInputItem{{Text: initialText, ContentCount: len(content)}}
+		for _, steer := range steers {
+			text := steer.Text
+			blocks := steer.Content
+			if steer.ProviderInputText != "" {
+				text = steer.ProviderInputText
+			}
+			if steer.ProviderInputCaptured {
+				blocks = steer.ProviderInputContent
+			}
+			inputs = append(inputs, retryProviderInputItem{
+				Text: text, ContentStart: len(content), ContentCount: len(blocks),
+			})
+			content = append(content, blocks...)
+		}
+		encoded, err := json.Marshal(inputs)
+		if err != nil {
+			return domain.RetryPrompt{}, fmt.Errorf("encode provider inputs %s: %w", turnID, err)
+		}
+		prompt.ProviderInputText = "AO prior provider inputs in order. Each JSON item is one complete input; content blocks follow contentStart and contentCount indices.\n" + string(encoded)
+	}
+	prompt.DeliveryContentJSON = ""
+	if len(content) > 0 {
+		encoded, err := json.Marshal(content)
+		if err != nil {
+			return domain.RetryPrompt{}, fmt.Errorf("encode provider input content %s: %w", turnID, err)
+		}
+		prompt.DeliveryContentJSON = string(encoded)
+	}
+	return prompt, nil
 }
 
 // RetryTurnIDForSource returns the retry attempt already linked to a source.
@@ -4802,9 +5230,38 @@ func (s *Store) CompleteSteerDelivery(
 	activity domain.ConversationActivity,
 	now time.Time,
 ) error {
+	return s.CompleteSteerBatchDelivery(ctx, conversationID, clientMessageID, providerTurnID, activity, nil, now)
+}
+
+// CompleteSteerBatchDelivery records the steer receipt and all source links together.
+func (s *Store) CompleteSteerBatchDelivery(
+	ctx context.Context,
+	conversationID, clientMessageID, providerTurnID string,
+	activity domain.ConversationActivity,
+	turnIDs []string,
+	now time.Time,
+) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	return s.inTx(ctx, "complete steer delivery", func(q *gen.Queries) error {
+		if len(turnIDs) > 0 {
+			target, err := q.SelectConversationTurnByProviderID(ctx, gen.SelectConversationTurnByProviderIDParams{
+				ConversationID: conversationID, ProviderTurnID: providerTurnID,
+			})
+			if err != nil {
+				return err
+			}
+			for _, id := range turnIDs {
+				changed, err := q.CompleteQueuedConversationBatchMember(ctx, gen.CompleteQueuedConversationBatchMemberParams{
+					CompletedAt:      sql.NullTime{Time: now, Valid: true},
+					PromotedToTurnID: sql.NullString{String: target.ID, Valid: true},
+					ID:               id, ConversationID: conversationID,
+				})
+				if checkErr := expectBatchRow("complete steered batch turn", id, changed, err); checkErr != nil {
+					return checkErr
+				}
+			}
+		}
 		txCtx := context.WithValue(ctx, conversationProjectionTxKey{}, q)
 		if err := s.UpsertActivity(txCtx, conversationID, providerTurnID, activity, now); err != nil {
 			return err

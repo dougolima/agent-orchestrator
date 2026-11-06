@@ -1,7 +1,8 @@
-import { forwardRef, type ButtonHTMLAttributes } from "react";
+import { createContext, forwardRef, useCallback, useContext, useRef, useState, type ButtonHTMLAttributes } from "react";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { DropdownMenu as DropdownMenuPrimitive } from "radix-ui";
 import { cn } from "../../lib/utils";
+import { ShieldOutsideClick, skipFocusHopToSibling, swallowClickAfter } from "./menu-focus";
 
 const SURFACE =
 	"settings-menu-surface min-w-[14rem] rounded-(--radius-settings-panel) border border-(--color-border-overlay) bg-settings-menu shadow-(--shadow-popover)";
@@ -22,12 +23,25 @@ export const MENU_TRIGGER_CHROME =
 	"settings-option-trigger max-w-full min-w-0 bg-[var(--color-bg-settings-trigger)] text-[var(--color-text-settings-trigger)] hover:bg-[var(--color-bg-settings-trigger-hover)] hover:text-[var(--color-text-settings-trigger)] data-[state=open]:bg-[var(--color-bg-settings-trigger-hover)] focus:outline-none focus-visible:outline-none focus-visible:ring-0 data-[state=open]:outline-none data-[state=open]:ring-0 disabled:cursor-not-allowed disabled:opacity-50";
 
 const TRIGGER = cn("group/option-menu-trigger", MENU_TRIGGER_CHROME);
+const CloseSubmenu = createContext<(() => void) | undefined>(undefined);
 
 // ---------------------------------------------------------------------------
 // Root — re-export for convenience
 // ---------------------------------------------------------------------------
 
-export const OptionMenu = DropdownMenuPrimitive.Root;
+/**
+ * Not modal by default. A modal menu locks scrolling (a stylesheet added and removed)
+ * and turns off pointer events on <body>; either restyles every element on the page
+ * when the menu opens and again when it closes. Unless `modal` is passed, an outside
+ * click still only closes the menu, as a modal one's would.
+ */
+export function OptionMenu({ modal, ...props }: React.ComponentProps<typeof DropdownMenuPrimitive.Root>) {
+	return (
+		<ShieldOutsideClick.Provider value={modal === undefined}>
+			<DropdownMenuPrimitive.Root modal={modal ?? false} {...props} />
+		</ShieldOutsideClick.Provider>
+	);
+}
 
 // ---------------------------------------------------------------------------
 // Trigger
@@ -59,12 +73,27 @@ export const OptionMenuTrigger = forwardRef<
 export function OptionMenuContent({
 	className,
 	sideOffset = 6,
+	steady,
 	children,
+	onPointerDownOutside,
 	...props
-}: React.ComponentProps<typeof DropdownMenuPrimitive.Content>) {
+}: React.ComponentProps<typeof DropdownMenuPrimitive.Content> & {
+	/**
+	 * Keep the rows still while open. A menu that opens upward is pinned by its bottom
+	 * edge, so a row that disappears would pull every row above it down under the pointer.
+	 */
+	steady?: boolean;
+}) {
+	const steadyRef = useSteadyHeight(steady);
+	const shield = useContext(ShieldOutsideClick);
 	return (
 		<DropdownMenuPrimitive.Portal>
 			<DropdownMenuPrimitive.Content
+				ref={steadyRef}
+				onPointerDownOutside={(event) => {
+					onPointerDownOutside?.(event);
+					if (shield) swallowClickAfter(event);
+				}}
 				data-browser-native-overlay="true"
 				sideOffset={sideOffset}
 				collisionPadding={16}
@@ -81,6 +110,39 @@ export function OptionMenuContent({
 			</DropdownMenuPrimitive.Content>
 		</DropdownMenuPrimitive.Portal>
 	);
+}
+
+/**
+ * Shrinks the panel from the bottom while the pointer is on it. The height it loses
+ * becomes a bottom margin, which the positioned wrapper still counts, so the top edge
+ * and every row stay put; the space sits outside the panel, between it and the
+ * trigger. Once the pointer leaves for anywhere but a submenu, the panel settles
+ * back onto its trigger.
+ */
+function useSteadyHeight(enabled: boolean | undefined) {
+	const cleanup = useRef<(() => void) | null>(null);
+	return useCallback((node: HTMLDivElement | null) => {
+		cleanup.current?.();
+		cleanup.current = null;
+		if (!node || !enabled) return;
+		let tallest = 0;
+		const observer = new ResizeObserver(() => {
+			const height = node.offsetHeight;
+			tallest = Math.max(tallest, height);
+			node.style.marginBottom = tallest > height ? `${tallest - height}px` : "";
+		});
+		const settle = (event: PointerEvent) => {
+			if (event.relatedTarget instanceof Element && event.relatedTarget.closest('[role="menu"]')) return;
+			tallest = node.offsetHeight;
+			node.style.marginBottom = "";
+		};
+		observer.observe(node);
+		node.addEventListener("pointerleave", settle);
+		cleanup.current = () => {
+			observer.disconnect();
+			node.removeEventListener("pointerleave", settle);
+		};
+	}, [enabled]);
 }
 
 // ---------------------------------------------------------------------------
@@ -108,6 +170,8 @@ export function OptionMenuItem({
 	active,
 	searchActive,
 	radio,
+	onPointerLeave,
+	onSelect,
 	...props
 }: React.ComponentProps<typeof DropdownMenuPrimitive.Item> & {
 	active?: boolean;
@@ -115,6 +179,7 @@ export function OptionMenuItem({
 	searchActive?: boolean;
 	radio?: boolean;
 }) {
+	const closeSubmenu = useContext(CloseSubmenu);
 	return (
 		<DropdownMenuPrimitive.Item
 			{...(radio === undefined
@@ -123,6 +188,20 @@ export function OptionMenuItem({
 			data-active={active || undefined}
 			data-search-active={searchActive || undefined}
 			className={cn(ROW, className)}
+			onPointerLeave={(event) => {
+				onPointerLeave?.(event);
+				skipFocusHopToSibling(event);
+			}}
+			onSelect={(event) => {
+				onSelect?.(event);
+				if (!closeSubmenu || event.defaultPrevented) return;
+				const triggerId = event.currentTarget instanceof HTMLElement
+					? event.currentTarget.closest('[role="menu"]')?.getAttribute("aria-labelledby")
+					: undefined;
+				event.preventDefault();
+				closeSubmenu();
+				if (triggerId) document.getElementById(triggerId)?.focus();
+			}}
 			{...props}
 		/>
 	);
@@ -132,7 +211,24 @@ export function OptionMenuItem({
 // Submenu — trigger row + subcontent panel
 // ---------------------------------------------------------------------------
 
-export const OptionMenuSub = DropdownMenuPrimitive.Sub;
+export function OptionMenuSub({
+	closeOnSelect = false,
+	open,
+	defaultOpen = false,
+	onOpenChange,
+	...props
+}: React.ComponentProps<typeof DropdownMenuPrimitive.Sub> & { closeOnSelect?: boolean }) {
+	const [localOpen, setLocalOpen] = useState(defaultOpen);
+	const changeOpen = (next: boolean) => {
+		setLocalOpen(next);
+		onOpenChange?.(next);
+	};
+	return (
+		<CloseSubmenu.Provider value={closeOnSelect ? () => changeOpen(false) : undefined}>
+			<DropdownMenuPrimitive.Sub open={open ?? localOpen} onOpenChange={changeOpen} {...props} />
+		</CloseSubmenu.Provider>
+	);
+}
 
 export function OptionMenuSubTrigger({
 	className,

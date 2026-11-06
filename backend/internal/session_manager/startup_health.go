@@ -55,7 +55,7 @@ func (m *Manager) checkSessionHealth(ctx context.Context, rec domain.SessionReco
 	}
 	handle := runtimeHandle(rec.Metadata)
 	if handle.ID == "" {
-		return m.recordTUIExitedForRecovery(ctx, rec)
+		return m.recordTerminalStoppedAtStartup(ctx, rec)
 	}
 	alive, err := m.runtime.IsAlive(ctx, handle)
 	if err != nil {
@@ -66,14 +66,17 @@ func (m *Manager) checkSessionHealth(ctx context.Context, rec domain.SessionReco
 		// intact; its unverified identity will not qualify for native restore.
 		return nil
 	}
-	return m.recordTUIExitedForRecovery(ctx, rec)
+	return m.recordTerminalStoppedAtStartup(ctx, rec)
 }
 
-// recordTUIExitedForRecovery records a dead TUI runtime as exited and holds the
-// session first, so the runtime reaper's tick right after boot recovery cannot
-// terminate a session that opening it should resume.
-func (m *Manager) recordTUIExitedForRecovery(ctx context.Context, rec domain.SessionRecord) error {
-	m.lcm.HoldExitedForRecovery(rec.ID, rec.Metadata.RuntimeLaunchID)
+// recordTerminalStoppedAtStartup keeps a terminal whose runtime ended while AO
+// was down (a reboot, a crash, a quit that stopped its agents) stopped and
+// resumable, like a Chat whose host is gone. Releasing the launch first stops
+// the reaper from reading that death as a crash and archiving the session.
+func (m *Manager) recordTerminalStoppedAtStartup(ctx context.Context, rec domain.SessionRecord) error {
+	if err := m.releaseTerminalRuntime(ctx, rec); err != nil {
+		return fmt.Errorf("check session %s: %w", rec.ID, err)
+	}
 	return m.recordAgentExited(ctx, rec)
 }
 

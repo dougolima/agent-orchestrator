@@ -1,12 +1,16 @@
-import { SquareTerminal, X } from "lucide-react";
+import { agentLabel } from "@aoagents/product-ui";
+import { CircleAlert, LoaderCircle, SquareTerminal, X } from "lucide-react";
 import { type KeyboardEvent, type MouseEvent, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useTruncatedText } from "../hooks/useTruncatedText";
 import type { ShellTerminal } from "../hooks/useShellTerminals";
 import { isWindowsPlatform } from "../lib/platform";
 import { cn } from "../lib/utils";
-import { TerminalTabFrame } from "./TerminalTabFrame";
-import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
+import { type ShellAgent, useShellAgentStore, useShellAgentStream } from "../stores/shell-agent-store";
+import { useUiStore } from "../stores/ui-store";
+import { AgentAvatar } from "./AgentAvatar";
+import { TerminalTabFrame, terminalTabActionClassName } from "./TerminalTabFrame";
+import { Pressable } from "./ui/pressable";
 
 type ShellTerminalTabProps = {
 	shell: ShellTerminal;
@@ -17,20 +21,20 @@ type ShellTerminalTabProps = {
 	appearance?: "pill" | "connected";
 	/** Commit a new tab title. Omitted where rename is not wired. */
 	onRename?: (title: string) => void;
+	/** Every shell tab handle in this strip; tabs running the same agent keep their numbers. */
+	stripShellHandleIds?: readonly string[];
 };
 
-// One standalone-shell tab, shared by the session pane's tab strip (CenterPane)
-// and the standalone /terminals screen (ShellTerminalsView) so the two never
-// drift. Session-pane tabs use a connected treatment that visually continues
-// into xterm below; the standalone terminals screen keeps its compact pill.
+// One shell tab in the session pane's tab strip (CenterPane). Session-pane
+// tabs use a connected treatment that visually continues into xterm below.
 // The full title only becomes the hover tooltip when the strip truncates it.
 //
 // Renaming happens inline with the platform's native gesture: double-click on
 // macOS/Linux, right-click on Windows. Enter or blur commits, Escape cancels,
 // and an empty or unchanged name is discarded. The close control is a sibling
 // button, not nested inside the tab button - nesting interactive elements is
-// invalid HTML and breaks keyboard traversal. Connected session-strip tabs hug
-// the title and reveal that sibling in the terminal glyph's slot on hover.
+// invalid HTML and breaks keyboard traversal. Connected session-strip tabs use
+// the shared TerminalTabFrame, which shows that sibling in the glyph's slot on hover.
 export function ShellTerminalTab({
 	shell,
 	isActive,
@@ -38,15 +42,34 @@ export function ShellTerminalTab({
 	onClose,
 	appearance = "pill",
 	onRename,
+	stripShellHandleIds,
 }: ShellTerminalTabProps) {
 	const { t } = useTranslation();
-	const title = shell.title;
-	const { ref, isTruncated } = useTruncatedText<HTMLButtonElement>(title);
 	const [isEditing, setIsEditing] = useState(false);
 	const [draft, setDraft] = useState(shell.title);
 	const inputRef = useRef<HTMLInputElement | null>(null);
 	const lastClickAtRef = useRef(0);
 	const canEdit = Boolean(onRename) && !shell.optimistic;
+	// The agent tab is a Developer Mode preview, like the simplified topbar.
+	const developerMode = useUiStore((state) => state.developerMode);
+	const tracksAgent = developerMode && !shell.optimistic && !shell.cloud && !shell.hostId;
+	useShellAgentStream(tracksAgent);
+	const agent = useShellAgentStore((state) => (tracksAgent ? state.agents[shell.handleId] : undefined));
+	const unseenDone = useShellAgentStore((state) => Boolean(state.unseenDone[shell.handleId]));
+	const markSeen = useShellAgentStore((state) => state.markSeen);
+	// A default-named tab ("Terminal 3") reads as its agent ("Claude Code"),
+	// keeping the number when another tab runs the same agent. Display only:
+	// rename edits the stored title, which returns when the agent exits.
+	const defaultNumber = /^Terminal (\d+)$/.exec(shell.title)?.[1];
+	const sharesAgent = useShellAgentStore((state) =>
+		Boolean(agent && stripShellHandleIds?.some((id) => id !== shell.handleId && state.agents[id]?.harness === agent.harness)),
+	);
+	const agentName = agent && defaultNumber ? agentLabel(agent.harness) : undefined;
+	const title = agentName ? (sharesAgent ? `${agentName} ${defaultNumber}` : agentName) : shell.title;
+	const { ref, isTruncated } = useTruncatedText<HTMLButtonElement>(title);
+	useEffect(() => {
+		if (isActive && unseenDone) markSeen(shell.handleId);
+	}, [isActive, markSeen, shell.handleId, unseenDone]);
 	// Rename gesture per platform: Windows uses right-click (its convention for
 	// tab/file renames); macOS and Linux use double-click.
 	const renameViaRightClick = isWindowsPlatform();
@@ -60,7 +83,7 @@ export function ShellTerminalTab({
 
 	const beginEdit = () => {
 		if (!canEdit || isEditing) return;
-		setDraft(title);
+		setDraft(shell.title);
 		setIsEditing(true);
 	};
 
@@ -114,7 +137,7 @@ export function ShellTerminalTab({
 
 	const cancel = () => {
 		setIsEditing(false);
-		setDraft(title);
+		setDraft(shell.title);
 	};
 
 	const closeControl = {
@@ -128,27 +151,16 @@ export function ShellTerminalTab({
 		onContextMenu: (event: MouseEvent) => event.stopPropagation(),
 		type: "button" as const,
 	};
-	const connectedGlyphClass =
-		"size-icon-sm shrink-0 translate-y-px";
-	const isConnected = appearance === "connected";
-	if (isConnected) {
+	if (appearance === "connected") {
 		const closeAction = isEditing || shell.optimistic ? undefined : (
-			<Tooltip>
-				<TooltipTrigger asChild>
-					<button
-						{...closeControl}
-						className="relative grid size-icon-sm place-items-center text-passive opacity-0 pointer-events-none before:absolute before:-inset-1.5 before:content-[''] transition-colors duration-fast ease-out hover:text-foreground group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent/50 motion-reduce:transition-none"
-					>
-						<X aria-hidden="true" className="size-icon-sm translate-y-px" />
-					</button>
-				</TooltipTrigger>
-				<TooltipContent side="bottom">{t("terminal.closeNamed", { title })}</TooltipContent>
-			</Tooltip>
+			<Pressable {...closeControl} className={terminalTabActionClassName}>
+				<X aria-hidden="true" className="size-icon-sm" />
+			</Pressable>
 		);
 		const editingContent = isEditing ? (
 			<input
 				aria-label={t("terminal.rename", { title })}
-				className="min-w-0 w-full rounded-sm border border-accent bg-background px-1 font-mono text-control font-semibold text-foreground shadow-sm outline-none ring-1 ring-accent"
+				className="min-w-0 flex-1 rounded-xs border border-accent bg-background px-1 text-control text-foreground outline-none ring-1 ring-accent"
 				onBlur={commit}
 				onChange={(event) => setDraft(event.target.value)}
 				onKeyDown={(event) => {
@@ -165,11 +177,10 @@ export function ShellTerminalTab({
 			/>
 		) : undefined;
 		return (
-		<TerminalTabFrame
-			action={closeAction}
-			actionLayout="overlay"
-			actionPosition="leading"
-			active={isActive}
+			<TerminalTabFrame
+				wide={Boolean(agent)}
+				action={closeAction}
+				active={isActive}
 				buttonProps={{
 					"aria-current": isActive,
 					"aria-selected": isActive,
@@ -185,51 +196,31 @@ export function ShellTerminalTab({
 					type: "button",
 				}}
 				buttonRef={ref}
-				className="max-w-shell-tab-max"
 				editingContent={editingContent}
-			>
-				<SquareTerminal
-					aria-hidden="true"
-					className={cn(
-						"size-icon-sm shrink-0",
-						closeAction && "group-hover:opacity-0 group-focus-within:opacity-0",
-					)}
-				/>
-				<span className="truncate">{title}</span>
-			</TerminalTabFrame>
+				icon={
+					agent ? (
+						<AgentAvatar className="size-icon-sm!" decorative provider={agent.harness} />
+					) : (
+						<SquareTerminal aria-hidden="true" className="size-icon-sm" />
+					)
+				}
+				label={title}
+				trailing={agent && !isEditing ? <ShellAgentStatus agent={agent} done={unseenDone && !isActive} /> : undefined}
+			/>
 		);
 	}
 
 	return (
 		<span
-			data-editing={isConnected && isEditing ? "true" : undefined}
 			className={cn(
-				"group relative h-full shrink-0 self-stretch items-center",
-				isConnected
-					? cn(
-							"session-tab-icon-floor session-tab-icon-floor--closable relative inline-flex max-w-shell-tab-max border-x border-transparent",
-							isEditing && "pl-2 pr-1",
-						)
-					: "inline-flex min-w-shell-tab-min shrink-0 items-center gap-1 rounded-md px-2 py-1",
-				isConnected
-					? isActive
-						? "border-border-strong bg-overlay text-foreground"
-						: "border-transparent text-passive hover:bg-raised hover:text-foreground"
-					: isActive
-						? "bg-interactive-active"
-						: "hover:bg-interactive-hover/60",
+				"group relative inline-flex h-full min-w-shell-tab-min shrink-0 self-stretch items-center gap-1 rounded-md px-2 py-1",
+				isActive ? "bg-interactive-active" : "hover:bg-interactive-hover/60",
 			)}
 		>
-			{isConnected && isEditing ? (
-				<SquareTerminal aria-hidden="true" className={cn("mr-1", connectedGlyphClass)} />
-			) : null}
 			{isEditing ? (
 				<input
 					aria-label={t("terminal.rename", { title })}
-					className={cn(
-						"rounded-sm border border-accent bg-background px-1 font-mono text-control font-semibold text-foreground shadow-sm outline-none ring-1 ring-accent",
-						isConnected ? "min-w-0 w-full text-left" : "min-w-flex-min max-w-shell-tab-max",
-					)}
+					className={cn("min-w-flex-min rounded-sm border border-accent bg-background px-1 font-mono text-control font-semibold text-foreground shadow-sm outline-none ring-1 ring-accent", agent ? "max-w-agent-shell-tab-max" : "max-w-shell-tab-max")}
 					onBlur={commit}
 					onChange={(event) => setDraft(event.target.value)}
 					onKeyDown={(event) => {
@@ -245,17 +236,14 @@ export function ShellTerminalTab({
 					value={draft}
 				/>
 			) : (
-				<button
+				<Pressable
 					ref={ref}
 					aria-current={isActive}
 					aria-selected={isActive}
 					className={cn(
-						"select-none truncate text-control focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent/50",
-						isConnected
-							? "inline-flex h-full min-w-0 cursor-pointer items-center pl-2 pr-2 text-left"
-							: "min-w-flex-min max-w-shell-tab-max cursor-pointer",
-					isConnected ? "font-normal" : "font-mono font-semibold",
+						"min-w-flex-min cursor-pointer select-none truncate font-mono text-control font-semibold focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent/50",
 						isActive ? "text-foreground" : "text-passive group-hover:text-foreground",
+						agent ? "max-w-agent-shell-tab-max" : "max-w-shell-tab-max",
 					)}
 					{...tabRenameHandlers}
 					{...renameKeyProps}
@@ -271,40 +259,40 @@ export function ShellTerminalTab({
 					type="button"
 				>
 					<span className="inline-flex min-w-0 -translate-y-px items-center">
-						{isConnected ? (
-							<SquareTerminal
-								aria-hidden="true"
-								className={cn(
-									"mr-1",
-									connectedGlyphClass,
-									"group-hover:opacity-0 group-focus-within:opacity-0",
-								)}
-							/>
-						) : null}
 						<span className="truncate">{title}</span>
 					</span>
-				</button>
+				</Pressable>
 			)}
-			{isConnected && (isEditing || shell.optimistic) ? null : (
-				<Tooltip>
-					<TooltipTrigger asChild>
-						<button
-							{...closeControl}
-							className={
-								isConnected
-									? "absolute inset-y-0 right-2 z-20 grid size-icon-sm place-items-center text-passive opacity-0 pointer-events-none before:absolute before:-inset-1.5 before:content-[''] transition-colors duration-fast ease-out hover:text-foreground group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 focus-visible:pointer-events-auto focus-visible:opacity-100 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent/50 motion-reduce:transition-none"
-									: "inline-flex h-control-sm w-control-sm shrink-0 items-center justify-center overflow-hidden text-passive opacity-0 transition-colors duration-fast ease-out hover:text-foreground group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent/50 motion-reduce:transition-none"
-								}
-							>
-							<X
-								aria-hidden="true"
-								className={isConnected ? "size-icon-sm translate-y-px" : "size-icon-sm"}
-							/>
-						</button>
-					</TooltipTrigger>
-					<TooltipContent side="bottom">{t("terminal.closeNamed", { title })}</TooltipContent>
-				</Tooltip>
-			)}
+			<Pressable
+				{...closeControl}
+				className="inline-flex h-control-sm w-control-sm shrink-0 items-center justify-center overflow-hidden text-passive opacity-0 transition-colors duration-fast ease-out hover:text-foreground group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent/50 motion-reduce:transition-none"
+			>
+				<X aria-hidden="true" className="size-icon-sm" />
+			</Pressable>
+		</span>
+	);
+}
+
+const AGENT_STATUS = {
+	working: {
+		label: "terminal.agentWorking",
+		icon: <LoaderCircle aria-hidden="true" className="size-3 animate-spin text-muted-foreground motion-reduce:animate-none" />,
+	},
+	waiting: { label: "terminal.agentWaiting", icon: <CircleAlert aria-hidden="true" className="size-3 text-destructive" /> },
+	done: { label: "terminal.agentDone", icon: <span aria-hidden="true" className="size-2 rounded-full bg-muted-foreground/60" /> },
+} as const;
+
+// The sidebar's status vocabulary: a spinner while the agent works, the red
+// alert while it waits on the user, and a dot for a finished turn not yet seen.
+function ShellAgentStatus({ agent, done }: { agent: ShellAgent; done: boolean }) {
+	const { t } = useTranslation();
+	const state = agent.state === "idle" ? (done ? "done" : undefined) : agent.state;
+	if (!state) return null;
+	const label = t(AGENT_STATUS[state].label, { agent: agentLabel(agent.harness) });
+	return (
+		<span className="inline-flex size-3 items-center justify-center" data-shell-agent-state={state} title={label}>
+			{AGENT_STATUS[state].icon}
+			<span className="sr-only">{label}</span>
 		</span>
 	);
 }

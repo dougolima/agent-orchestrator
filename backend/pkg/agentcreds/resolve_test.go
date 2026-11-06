@@ -173,7 +173,7 @@ func TestKeychainSuccessIsSourceFive(t *testing.T) {
 // the probe sends x-api-key, not Bearer.
 func TestKeychainManagedKeyResolvesAsAPIKey(t *testing.T) {
 	cred, ok := ResolveLocal(context.Background(), ProviderFirstParty, ResolveOptions{
-		Env: envFrom(nil), ConfigDir: t.TempDir(), GOOS: "darwin", AllowKeychain: true,
+		Env: envFrom(map[string]string{"HOME": t.TempDir()}), GOOS: "darwin", AllowKeychain: true,
 		Runner: func(_ context.Context, _ string, args ...string) ([]byte, error) {
 			if len(args) >= 3 && args[2] == "Claude Code" {
 				return []byte("sk-ant-api03-managed-key"), nil
@@ -210,17 +210,11 @@ func TestKeychainManagedKeyWinsOverStaleLegacyCredential(t *testing.T) {
 	defer server.Close()
 
 	credential, found := ResolveLocal(context.Background(), ProviderFirstParty, ResolveOptions{
-		Env: envFrom(nil), ConfigDir: t.TempDir(), GOOS: "darwin", AllowKeychain: true,
-		Runner: func(_ context.Context, _ string, args ...string) ([]byte, error) {
-			switch {
-			case len(args) >= 3 && args[2] == keychainServiceCredentials:
-				return []byte(`{"claudeAiOauth":{"accessToken":"sk-ant-oat01-stale"}}`), nil
-			case len(args) >= 3 && args[2] == keychainServiceManagedKey:
-				return []byte("sk-ant-api03-current"), nil
-			default:
-				return nil, errors.New("security: item not found")
-			}
-		},
+		Env: envFrom(map[string]string{"USER": "someone"}), GOOS: "darwin", AllowKeychain: true,
+		Runner: fakeKeychain(
+			[3]string{keychainServiceCredentials, "someone", `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-stale"}}`},
+			[3]string{keychainServiceManagedKey, "someone", "sk-ant-api03-current"},
+		),
 	})
 	if !found {
 		t.Fatal("expected a Keychain credential")
@@ -234,13 +228,10 @@ func TestKeychainManagedKeyWinsOverStaleLegacyCredential(t *testing.T) {
 
 func TestLegacyKeychainCredentialStillResolvesWithoutManagedKey(t *testing.T) {
 	cred, ok := ResolveLocal(context.Background(), ProviderFirstParty, ResolveOptions{
-		Env: envFrom(nil), ConfigDir: t.TempDir(), GOOS: "darwin", AllowKeychain: true,
-		Runner: func(_ context.Context, _ string, args ...string) ([]byte, error) {
-			if len(args) >= 3 && args[2] == keychainServiceCredentials {
-				return []byte(`{"claudeAiOauth":{"accessToken":"sk-ant-oat01-legacy"}}`), nil
-			}
-			return nil, errors.New("security: item not found")
-		},
+		Env: envFrom(map[string]string{"USER": "someone"}), GOOS: "darwin", AllowKeychain: true,
+		Runner: fakeKeychain(
+			[3]string{keychainServiceCredentials, "someone", `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-legacy"}}`},
+		),
 	})
 	if !ok || cred.Kind != KindOAuthToken || cred.Secret != "sk-ant-oat01-legacy" {
 		t.Fatalf("legacy credential = %#v, found = %v", cred, ok)
@@ -252,7 +243,7 @@ func TestLegacyKeychainCredentialStillResolvesWithoutManagedKey(t *testing.T) {
 // "Claude Code" managed-key service rather than report no credential.
 func TestKeychainEmptyCredentialsFallsThroughToManagedKey(t *testing.T) {
 	cred, ok := ResolveLocal(context.Background(), ProviderFirstParty, ResolveOptions{
-		Env: envFrom(nil), ConfigDir: t.TempDir(), GOOS: "darwin", AllowKeychain: true,
+		Env: envFrom(map[string]string{"HOME": t.TempDir()}), GOOS: "darwin", AllowKeychain: true,
 		Runner: func(_ context.Context, _ string, args ...string) ([]byte, error) {
 			switch {
 			case len(args) >= 3 && args[2] == "Claude Code-credentials":
@@ -281,7 +272,7 @@ func TestKeychainEmptyCredentialsFallsThroughToManagedKey(t *testing.T) {
 // key even though the credential is valid.
 func TestKeychainSetupTokenFromClassifiedAsOAuth(t *testing.T) {
 	cred, ok := ResolveLocal(context.Background(), ProviderFirstParty, ResolveOptions{
-		Env: envFrom(nil), ConfigDir: t.TempDir(), GOOS: "darwin", AllowKeychain: true,
+		Env: envFrom(map[string]string{"HOME": t.TempDir()}), GOOS: "darwin", AllowKeychain: true,
 		Runner: func(_ context.Context, _ string, args ...string) ([]byte, error) {
 			switch {
 			case len(args) >= 3 && args[2] == "Claude Code-credentials":
@@ -456,6 +447,29 @@ func TestStoredLoginCarriesExpiryAndRenewability(t *testing.T) {
 				t.Fatal("a token at its expiry with a refresh token must read as expired but renewable")
 			}
 		})
+	}
+}
+
+// A refresh token carries its own expiry. Past it, Claude Code cannot renew the
+// login either, so the expired access token must be judged by the provider.
+func TestExpiredLoginIsRenewableOnlyWhileItsRefreshTokenIsInDate(t *testing.T) {
+	expiresAt := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	refreshExpiresAt := expiresAt.Add(21 * 24 * time.Hour)
+	dir := t.TempDir()
+	content := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"sk-ant-oat01-stored","refreshToken":"sk-ant-ort01-stored","expiresAt":%d,"refreshTokenExpiresAt":%d}}`,
+		expiresAt.UnixMilli(), refreshExpiresAt.UnixMilli())
+	if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cred, ok := ResolveLocal(context.Background(), ProviderFirstParty, ResolveOptions{Env: envFrom(nil), ConfigDir: dir, GOOS: "linux"})
+	if !ok || !cred.RefreshExpiresAt.Equal(refreshExpiresAt) {
+		t.Fatalf("refresh expiry = %v ok=%v, want %v", cred.RefreshExpiresAt, ok, refreshExpiresAt)
+	}
+	if !cred.ExpiredButRenewable(refreshExpiresAt.Add(-time.Minute)) {
+		t.Fatal("an expired access token with an in-date refresh token must read as renewable")
+	}
+	if cred.ExpiredButRenewable(refreshExpiresAt) {
+		t.Fatal("an expired refresh token cannot renew the login")
 	}
 }
 

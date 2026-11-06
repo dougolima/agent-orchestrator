@@ -724,7 +724,7 @@ WHERE id = ?;
 
 -- name: SettleConversationTurn :exec
 UPDATE conversation_turns
-SET state = ?, error_message = ?, completed_at = COALESCE(completed_at, ?)
+SET state = ?, error_message = ?, failure_code = ?, completed_at = COALESCE(completed_at, ?)
 WHERE id = ?;
 
 -- A streamed assistant item may not receive item/completed when steering causes
@@ -1010,8 +1010,17 @@ UPDATE conversation_turns
 SET rolled_back_at = ?
 WHERE conversation_turns.conversation_id = ?
   AND conversation_turns.rolled_back_at IS NULL
-  AND conversation_turns.rowid >= (
-      SELECT anchor.rowid FROM conversation_turns AS anchor WHERE anchor.id = ?
+  AND (
+      conversation_turns.rowid >= (
+          SELECT anchor.rowid FROM conversation_turns AS anchor WHERE anchor.id = sqlc.arg(anchor_turn_id)
+      )
+      OR conversation_turns.promoted_to_turn_id IN (
+          SELECT target.id FROM conversation_turns AS target
+          WHERE target.conversation_id = conversation_turns.conversation_id
+            AND target.rowid >= (
+                SELECT anchor.rowid FROM conversation_turns AS anchor WHERE anchor.id = sqlc.arg(anchor_turn_id)
+            )
+      )
   );
 
 -- A discarded turn that never reached the provider settles as interrupted rather
@@ -1090,7 +1099,10 @@ SELECT conversation_turns.id,
        conversation_messages.text,
        conversation_messages.client_message_id,
        conversation_messages.origin,
-       conversation_messages.delivery_content_json
+       conversation_messages.delivery_content_json,
+       conversation_messages.sender_session_id,
+       conversation_messages.sender_project_id,
+       conversation_messages.sender_display_name
 FROM conversation_turns
 JOIN conversation_messages
     ON conversation_messages.turn_id = conversation_turns.id
@@ -1100,6 +1112,24 @@ WHERE conversation_turns.conversation_id = ?
   AND conversation_turns.promotion_started_at IS NULL
 ORDER BY conversation_turns.requested_at, conversation_turns.rowid
 LIMIT 1;
+
+-- name: SelectQueuedConversationBatch :many
+SELECT conversation_turns.id,
+       conversation_messages.text,
+       conversation_messages.client_message_id,
+       conversation_messages.origin,
+       conversation_messages.delivery_content_json,
+       conversation_messages.sender_session_id,
+       conversation_messages.sender_project_id,
+       conversation_messages.sender_display_name
+FROM conversation_turns
+JOIN conversation_messages
+    ON conversation_messages.turn_id = conversation_turns.id
+    AND conversation_messages.role = 'user'
+WHERE conversation_turns.conversation_id = ?
+  AND conversation_turns.state = 'queued'
+  AND conversation_turns.promotion_started_at IS NULL
+ORDER BY conversation_turns.requested_at, conversation_turns.rowid;
 
 -- Claim one selected queue item before contacting the provider. execrows is the
 -- compare-and-set result: zero means the turn is absent, settled, or already being
@@ -1119,6 +1149,7 @@ SELECT conversation_turns.id,
        conversation_messages.text,
        conversation_messages.client_message_id,
        conversation_messages.origin,
+       conversation_messages.authored_by_user,
        conversation_messages.delivery_content_json
 FROM conversation_turns
 JOIN conversation_messages
@@ -1140,6 +1171,17 @@ WHERE id = sqlc.arg(id)
   AND state = 'queued'
   AND promotion_started_at IS NOT NULL;
 
+-- A detached controller may have crossed the provider boundary before its
+-- batch receipt was recorded. Keep the source visible and fail closed on resume.
+-- name: FailReservedQueuedConversationTurns :exec
+UPDATE conversation_turns
+SET state = 'failed',
+    error_message = 'queued delivery outcome is uncertain after controller reconnect',
+    completed_at = ?
+WHERE conversation_id = ?
+  AND state = 'queued'
+  AND promotion_started_at IS NOT NULL;
+
 -- The provider has accepted the guidance. Link the durable source to the AO turn
 -- that absorbed it and take it out of the queue in the same transaction that
 -- inserts the visible steer activity.
@@ -1153,6 +1195,26 @@ WHERE id = sqlc.arg(id)
   AND conversation_id = sqlc.arg(conversation_id)
   AND state = 'queued'
   AND promotion_started_at IS NOT NULL;
+
+-- A batched source joins one provider input but remains its own visible message.
+-- name: CompleteQueuedConversationBatchMember :execrows
+UPDATE conversation_turns
+SET state = 'completed',
+    completed_at = sqlc.arg(completed_at),
+    promotion_started_at = NULL,
+    promoted_to_turn_id = sqlc.arg(promoted_to_turn_id),
+    batched_input = 1
+WHERE id = sqlc.arg(id)
+  AND conversation_id = sqlc.arg(conversation_id)
+  AND state = 'queued'
+  AND promotion_started_at IS NOT NULL;
+
+-- Remember the exact combined input so native history replay can identify it
+-- without replacing the separate AO transcript messages.
+-- name: SetConversationProviderInputText :execrows
+UPDATE conversation_turns
+SET provider_input_text = ?
+WHERE id = ? AND state IN ('queued', 'running', 'completed') AND provider_input_text = '';
 
 -- Stopping the agent stops the queue with it: a brake that starts new work
 -- instead of ending it would be the wrong shape for the button the user pressed.
@@ -1235,9 +1297,28 @@ WHERE id = ?
 INSERT INTO conversation_messages (
     id, conversation_id, turn_id, sequence, revision, role, origin,
     text, streaming, provider_item_id, client_message_id, client_payload_hash,
-    delivery_content_json, continuation, sender_session_id, sender_project_id, sender_display_name,
+    delivery_content_json, continuation, authored_by_user, sender_session_id, sender_project_id, sender_display_name,
     created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+-- name: IncrementUsageMessageSummary :exec
+-- Adds one human message: a direct Chat message (pending_count), a steer, or
+-- a `/send`, plus at most one of the surface counters. Each counter is 0 or 1.
+INSERT INTO usage_message_summary (session_id, pending_count, steer_count, send_count,
+    desktop_count, mobile_count, cli_count, first_at, last_at)
+SELECT sqlc.arg(session_id), sqlc.arg(chat), sqlc.arg(steer), sqlc.arg(send),
+    sqlc.arg(desktop), sqlc.arg(mobile), sqlc.arg(cli), sqlc.arg(first_at), sqlc.arg(last_at) WHERE EXISTS (
+    SELECT 1 FROM sessions WHERE id = sqlc.arg(session_id) AND project_id IS NOT NULL
+)
+ON CONFLICT(session_id) DO UPDATE SET
+    pending_count = MIN(usage_message_summary.pending_count + excluded.pending_count, 1000000000),
+    steer_count = MIN(usage_message_summary.steer_count + excluded.steer_count, 1000000000),
+    send_count = MIN(usage_message_summary.send_count + excluded.send_count, 1000000000),
+    desktop_count = MIN(usage_message_summary.desktop_count + excluded.desktop_count, 1000000000),
+    mobile_count = MIN(usage_message_summary.mobile_count + excluded.mobile_count, 1000000000),
+    cli_count = MIN(usage_message_summary.cli_count + excluded.cli_count, 1000000000),
+    first_at = COALESCE(usage_message_summary.first_at, excluded.first_at),
+    last_at = excluded.last_at;
 
 -- Folding a streaming delta: append to the existing text and bump the revision
 -- so a client can detect a gap. The provider item id is the correlation key
@@ -1316,12 +1397,14 @@ WHERE conversation_messages.conversation_id = sqlc.arg(conversation_id)
       WHERE discarded.conversation_id = sqlc.arg(conversation_id)
         AND (
           discarded.rolled_back_at IS NOT NULL
-          OR discarded.promoted_to_turn_id IS NOT NULL
+          OR (discarded.promoted_to_turn_id IS NOT NULL AND discarded.batched_input = 0)
           OR discarded.state = 'cancelled'
         )
   ))
 ORDER BY conversation_messages.sequence;
 
+-- Budget IDs and byte lengths before loading payload columns. A single
+-- oversized row remains readable so every page cursor can advance.
 -- name: SelectConversationMessagesPage :many
 WITH RECURSIVE active_path(branch_id, max_sequence) AS (
     SELECT conversations.active_branch_id, CAST(NULL AS INTEGER)
@@ -1337,8 +1420,10 @@ WITH RECURSIVE active_path(branch_id, max_sequence) AS (
     FROM active_path AS path
     JOIN conversation_branches AS branch ON branch.id = path.branch_id
     WHERE branch.parent_branch_id IS NOT NULL
-)
-SELECT conversation_messages.* FROM conversation_messages
+), page_candidates AS (
+SELECT conversation_messages.id, conversation_messages.sequence,
+       length(CAST(conversation_messages.text AS BLOB)) + length(CAST(conversation_messages.delivery_content_json AS BLOB)) AS row_bytes
+FROM conversation_messages
 JOIN active_path AS path ON path.branch_id = conversation_messages.branch_id
 WHERE conversation_messages.conversation_id = sqlc.arg(conversation_id)
   AND conversation_messages.sequence < sqlc.arg(before_sequence)
@@ -1348,12 +1433,22 @@ WHERE conversation_messages.conversation_id = sqlc.arg(conversation_id)
       WHERE discarded.conversation_id = sqlc.arg(conversation_id)
         AND (
           discarded.rolled_back_at IS NOT NULL
-          OR discarded.promoted_to_turn_id IS NOT NULL
+          OR (discarded.promoted_to_turn_id IS NOT NULL AND discarded.batched_input = 0)
           OR discarded.state = 'cancelled'
         )
   ))
 ORDER BY conversation_messages.sequence DESC
-LIMIT sqlc.arg(page_limit);
+LIMIT sqlc.arg(page_limit)
+), page_budget(id, sequence, total_bytes, row_position) AS (
+    SELECT id, sequence,
+           SUM(row_bytes) OVER (ORDER BY sequence DESC ROWS UNBOUNDED PRECEDING) AS total_bytes,
+           ROW_NUMBER() OVER (ORDER BY sequence DESC) AS row_position
+    FROM page_candidates
+)
+SELECT conversation_messages.* FROM conversation_messages
+JOIN page_budget AS budget ON conversation_messages.id = budget.id
+WHERE budget.total_bytes <= CAST(sqlc.arg(page_bytes) AS INTEGER) OR budget.row_position = 1
+ORDER BY budget.sequence DESC;
 
 -- name: InsertConversationActivity :exec
 INSERT INTO conversation_activities (
@@ -1365,6 +1460,64 @@ INSERT INTO conversation_activities (
 UPDATE conversation_activities
 SET status = ?, summary = ?, detail_json = ?, revision = revision + 1, updated_at = ?
 WHERE conversation_id = ? AND provider_item_id = ? AND status <> 'cancelled';
+
+-- A list the agent keeps across turns has one current copy on the active path:
+-- the one written last. Every copy has a plan row, a turn's included, so the rows
+-- on the path decide it, with the same branch and discarded-turn filters as the
+-- timeline. Copies on other branches keep their marks until their branch is
+-- active again.
+-- name: SelectSpanningPlanCopiesOnActivePath :many
+WITH RECURSIVE active_path(branch_id, max_sequence) AS (
+    SELECT conversations.active_branch_id, CAST(NULL AS INTEGER)
+    FROM conversations
+    WHERE conversations.id = sqlc.arg(conversation_id)
+    UNION ALL
+    SELECT branch.parent_branch_id,
+           CASE
+               WHEN path.max_sequence IS NULL THEN branch.fork_after_sequence
+               WHEN branch.fork_after_sequence < path.max_sequence THEN branch.fork_after_sequence
+               ELSE path.max_sequence
+           END
+    FROM active_path AS path
+    JOIN conversation_branches AS branch ON branch.id = path.branch_id
+    WHERE branch.parent_branch_id IS NOT NULL
+)
+SELECT activity.id,
+       activity.turn_id,
+       activity.sequence,
+       activity.detail_json,
+       activity.created_at,
+       turn.completed_at AS turn_completed_at
+FROM conversation_activities AS activity
+JOIN active_path AS path ON path.branch_id = activity.branch_id
+LEFT JOIN conversation_turns AS turn ON turn.id = activity.turn_id
+WHERE activity.conversation_id = sqlc.arg(conversation_id)
+  AND activity.kind = 'plan'
+  AND json_valid(activity.detail_json)
+  AND json_extract(activity.detail_json, '$.spansTurns') = 1
+  AND (path.max_sequence IS NULL OR activity.sequence <= path.max_sequence)
+  AND (turn.id IS NULL OR (turn.rolled_back_at IS NULL AND turn.state <> 'cancelled'))
+ORDER BY activity.sequence;
+
+-- name: SetConversationPlanActivitySuperseded :exec
+UPDATE conversation_activities
+SET detail_json = CASE WHEN CAST(sqlc.arg(superseded) AS BOOLEAN)
+                       THEN json_set(detail_json, '$.superseded', json('true'))
+                       ELSE json_remove(detail_json, '$.superseded') END,
+    revision = revision + 1,
+    updated_at = sqlc.arg(updated_at)
+WHERE id = sqlc.arg(id)
+  AND ifnull(json_extract(detail_json, '$.superseded'), 0) <> CAST(sqlc.arg(superseded) AS BOOLEAN);
+
+-- name: SetConversationTurnPlanSuperseded :exec
+UPDATE conversation_turns
+SET plan_json = CASE WHEN CAST(sqlc.arg(superseded) AS BOOLEAN)
+                     THEN json_set(plan_json, '$.superseded', json('true'))
+                     ELSE json_remove(plan_json, '$.superseded') END
+WHERE id = sqlc.arg(id)
+  AND plan_json <> ''
+  AND json_valid(plan_json)
+  AND ifnull(json_extract(plan_json, '$.superseded'), 0) <> CAST(sqlc.arg(superseded) AS BOOLEAN);
 
 -- Resolving an approval matches on the provider's request id, so a card the user
 -- left on screen cannot answer a request that replaced it.
@@ -1565,6 +1718,8 @@ WHERE conversation_activities.conversation_id = sqlc.arg(conversation_id)
   ))
 ORDER BY conversation_activities.sequence;
 
+-- Budget IDs and byte lengths before loading payload columns. A single
+-- oversized row remains readable so every page cursor can advance.
 -- name: SelectConversationActivitiesPage :many
 WITH RECURSIVE active_path(branch_id, max_sequence) AS (
     SELECT conversations.active_branch_id, CAST(NULL AS INTEGER)
@@ -1580,8 +1735,10 @@ WITH RECURSIVE active_path(branch_id, max_sequence) AS (
     FROM active_path AS path
     JOIN conversation_branches AS branch ON branch.id = path.branch_id
     WHERE branch.parent_branch_id IS NOT NULL
-)
-SELECT conversation_activities.* FROM conversation_activities
+), page_candidates AS (
+SELECT conversation_activities.id, conversation_activities.sequence,
+       length(CAST(conversation_activities.summary AS BLOB)) + length(CAST(conversation_activities.detail_json AS BLOB)) + length(CAST(conversation_activities.command_output AS BLOB)) + length(CAST(conversation_activities.streamed_text AS BLOB)) AS row_bytes
+FROM conversation_activities
 JOIN active_path AS path ON path.branch_id = conversation_activities.branch_id
 WHERE conversation_activities.conversation_id = sqlc.arg(conversation_id)
   AND conversation_activities.sequence < sqlc.arg(before_sequence)
@@ -1595,7 +1752,17 @@ WHERE conversation_activities.conversation_id = sqlc.arg(conversation_id)
         )
   ))
 ORDER BY conversation_activities.sequence DESC
-LIMIT sqlc.arg(page_limit);
+LIMIT sqlc.arg(page_limit)
+), page_budget(id, sequence, total_bytes, row_position) AS (
+    SELECT id, sequence,
+           SUM(row_bytes) OVER (ORDER BY sequence DESC ROWS UNBOUNDED PRECEDING) AS total_bytes,
+           ROW_NUMBER() OVER (ORDER BY sequence DESC) AS row_position
+    FROM page_candidates
+)
+SELECT conversation_activities.* FROM conversation_activities
+JOIN page_budget AS budget ON conversation_activities.id = budget.id
+WHERE budget.total_bytes <= CAST(sqlc.arg(page_bytes) AS INTEGER) OR budget.row_position = 1
+ORDER BY budget.sequence DESC;
 
 -- Push a provider thread title into the session label, without ever overwriting a
 -- name a person chose.
@@ -1677,6 +1844,7 @@ SELECT conversation_messages.text,
        conversation_messages.origin,
        conversation_messages.continuation,
        conversation_messages.delivery_content_json,
+       conversation_turns.provider_input_text,
        EXISTS (
            SELECT 1
            FROM active_path AS path
@@ -1691,6 +1859,29 @@ WHERE conversation_turns.id = sqlc.arg(id)
   AND conversation_turns.conversation_id = sqlc.arg(conversation_id)
   AND conversation_turns.state = 'failed'
 LIMIT 1;
+
+-- Content blocks for every message absorbed by a failed provider turn.
+-- Row order matches the original batch, including steer fallback batches.
+-- name: SelectConversationProviderInputContent :many
+SELECT conversation_turns.id AS source_turn_id, conversation_messages.delivery_content_json
+FROM conversation_turns
+JOIN conversation_messages ON conversation_messages.turn_id = conversation_turns.id
+    AND conversation_messages.role = 'user'
+WHERE conversation_turns.conversation_id = sqlc.arg(conversation_id)
+  AND (conversation_turns.id = sqlc.arg(turn_id)
+       OR conversation_turns.promoted_to_turn_id = sqlc.arg(turn_id))
+ORDER BY conversation_turns.rowid;
+
+-- Accepted steering inputs are separate provider inputs on the same turn.
+-- Their detail rows retain the exact content sent to the provider.
+-- name: SelectConversationSteerRetryInputs :many
+SELECT detail_json FROM conversation_activities
+WHERE conversation_id = sqlc.arg(conversation_id)
+  AND turn_id = sqlc.arg(turn_id)
+  AND kind = 'system'
+  AND status = 'completed'
+  AND json_extract(detail_json, '$.event') = 'steer'
+ORDER BY sequence;
 
 -- A replayed retry request returns the attempt already linked to its source.
 -- The relation is daemon-owned rather than inferred from caller-controlled text.
@@ -1889,6 +2080,14 @@ WHERE t.conversation_id = sqlc.arg(conversation_id)
   AND t.started_at > sqlc.arg(after_at)
   AND t.completed_at > sqlc.arg(after_at)
 ORDER BY t.completed_at DESC LIMIT 1;
+
+-- Session conversations still waiting for the user to sign in again, with the
+-- harness each session runs, so a confirmed login can be matched to them.
+-- name: SelectConversationsAwaitingLogin :many
+SELECT conversations.id AS conversation_id, sessions.id AS session_id, sessions.harness
+FROM conversations
+JOIN sessions ON sessions.id = conversations.current_session_id
+WHERE json_extract(conversations.account_json, '$.reauthRequiredAt') IS NOT NULL;
 
 
 -- Queued work stays held behind a failed source until its retry succeeds.

@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/deliverytelemetry"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/reqid"
@@ -156,6 +157,12 @@ func WithNotificationSink(sink notificationSink) Option {
 	return func(m *Manager) { m.notifications = sink }
 }
 
+// WithDeliveryTelemetry reports ao.sessions.ended for the terminations lifecycle
+// itself decides (runtime death, merge and issue-close teardown).
+func WithDeliveryTelemetry(r *deliverytelemetry.Recorder) Option {
+	return func(m *Manager) { m.delivery = r }
+}
+
 // WithTelemetry wires lifecycle activity transitions to the shared telemetry sink.
 func WithTelemetry(sink ports.EventSink) Option {
 	return func(m *Manager) { m.telemetry = sink }
@@ -247,6 +254,7 @@ type Manager struct {
 	clock     func() time.Time
 	react     reactionState
 	telemetry ports.EventSink
+	delivery  *deliverytelemetry.Recorder
 	// flights tracks, per session, the in-flight tool executions and the
 	// pending permission dialog's identity (see toolFlight). Guarded by mu.
 	flights map[domain.SessionID]*toolFlight
@@ -259,10 +267,6 @@ type Manager struct {
 	// This coordination is intentionally memory-only: a daemon crash leaves the
 	// durable session exited, so the user can safely retry the resume.
 	pendingLaunches map[domain.SessionID]pendingLaunch
-	// heldForRecovery maps a session that boot reconciliation preserved after a
-	// failed relaunch to the runtime launch it already knows is dead. Guarded by
-	// mu. Memory-only: every boot reruns reconciliation and re-establishes it.
-	heldForRecovery map[domain.SessionID]string
 	// steerActive reports whether a harness can safely receive a write during an
 	// active turn (input steers the run) rather than only while idle. Supplied by
 	// the agent adapter via WithActiveSteering; the default answers false, so an
@@ -292,7 +296,6 @@ func New(store sessionStore, messenger ports.AgentMessenger, opts ...Option) *Ma
 		flights:                     map[domain.SessionID]*toolFlight{},
 		steps:                       map[domain.SessionID][]domain.SessionStep{},
 		pendingLaunches:             map[domain.SessionID]pendingLaunch{},
-		heldForRecovery:             map[domain.SessionID]string{},
 		steerActive:                 func(domain.AgentHarness) bool { return false },
 		startupSignalGatesInput:     func(domain.AgentHarness) bool { return false },
 		urgentNudgeWaitingInputSafe: func(domain.AgentHarness) bool { return false },
@@ -464,9 +467,7 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 		}
 		// AO destroyed this launch's terminal on purpose and kept the session
 		// (an agent exit); Resume builds a new one. Its death is not a crash.
-		if m.heldForRecoveryLocked(id, cur) ||
-			(cur.Activity.State == domain.ActivityExited && currentLaunch != "" &&
-				cur.Metadata.RuntimeReleasedLaunchID == currentLaunch) {
+		if cur.RuntimeReleased() {
 			return cur, false
 		}
 		if !runtimeClearlyDead(f, cur.Activity, now, m.window) {
@@ -487,8 +488,9 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 	finalizeSessionUsage(ctx, id, terminationLaunch, terminationRevision, finalizer)
 
 	terminated := false
+	var beforeEnd domain.SessionRecord
 	err := m.mutate(ctx, id, func(cur domain.SessionRecord, now time.Time) (domain.SessionRecord, bool) {
-		if cur.IsTerminated || cur.Revision != terminationRevision || m.heldForRecoveryLocked(id, cur) ||
+		if cur.IsTerminated || cur.Revision != terminationRevision ||
 			cur.Metadata.RuntimeLaunchID != terminationLaunch || !matchesLaunch(cur) ||
 			!runtimeClearlyDead(f, cur.Activity, now, m.window) || m.sessionMutationInProgress(id) {
 			return cur, false
@@ -504,12 +506,14 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 		delete(m.flights, id)
 		delete(m.steps, id)
 		terminated = true
+		beforeEnd = cur
 		return next, true
 	})
 	if err != nil {
 		return err
 	}
 	if terminated {
+		m.delivery.SessionEnded(ctx, beforeEnd, deliverytelemetry.EndRuntimeDied)
 		// Route reaper-observed death through the same container-reap hook as
 		// every other terminal path (#2652): a crash/SIGKILL detected by the
 		// runtime reaper must not leave the session's Docker containers behind
@@ -517,32 +521,6 @@ func (m *Manager) ApplyRuntimeObservation(ctx context.Context, id domain.Session
 		m.reapSessionContainers(ctx, id)
 	}
 	return nil
-}
-
-// HoldExitedForRecovery keeps a session that boot reconciliation preserved
-// after a failed relaunch from being terminated by the runtime launch it already
-// knows is dead. Resume Agent refuses terminated sessions, so without the hold
-// the reaper's next tick would close the recovery path reconciliation kept open.
-// The hold ends when the session launches again under a new launch id.
-func (m *Manager) HoldExitedForRecovery(id domain.SessionID, launchID string) {
-	m.mu.Lock()
-	m.heldForRecovery[id] = launchID
-	m.mu.Unlock()
-}
-
-// heldForRecoveryLocked reports whether cur is still the exited launch that
-// HoldExitedForRecovery protected, dropping a hold a newer launch has outlived.
-// Callers hold m.mu.
-func (m *Manager) heldForRecoveryLocked(id domain.SessionID, cur domain.SessionRecord) bool {
-	launchID, ok := m.heldForRecovery[id]
-	if !ok {
-		return false
-	}
-	if launchID != cur.Metadata.RuntimeLaunchID {
-		delete(m.heldForRecovery, id)
-		return false
-	}
-	return cur.Activity.State == domain.ActivityExited
 }
 
 // A concurrent session writer can advance updated_at between lifecycle's read
@@ -1443,6 +1421,9 @@ func (m *Manager) emitTelemetry(ctx context.Context, ev ports.TelemetryEvent) {
 	}
 	if ev.RequestID == "" {
 		ev.RequestID = reqid.FromContext(ctx)
+	}
+	if ev.Name == "ao.session.waiting_input_entered" && ev.SessionID != nil {
+		m.countWaitingInput(ctx, *ev.SessionID)
 	}
 	m.telemetry.Emit(ctx, ev)
 }

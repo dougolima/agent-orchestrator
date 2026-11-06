@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -205,6 +204,39 @@ func TestTick_MinorityDeadPassesThroughBreaker(t *testing.T) {
 	}
 }
 
+// A session whose launch AO ended on purpose (an agent exit, or a runtime found
+// gone at startup) keeps its dead handle until it is resumed. Probing it would
+// count it as dead on every pass: enough stopped sessions then trip the breaker
+// for good and every real crash is downgraded to an inconclusive probe.
+func TestTick_SkipsReleasedLaunchSoStoppedSessionsDoNotTripBreaker(t *testing.T) {
+	lcm := &fakeLCM{}
+	alive := map[string]bool{}
+	var rows []domain.SessionRecord
+	for _, id := range []domain.SessionID{"stopped-1", "stopped-2", "stopped-3", "stopped-4", "stopped-5"} {
+		rec := handledSession(id)
+		rec.Activity = domain.Activity{State: domain.ActivityExited}
+		rec.Metadata.RuntimeLaunchID = "launch-" + string(id)
+		rec.Metadata.RuntimeReleasedLaunchID = rec.Metadata.RuntimeLaunchID
+		rows = append(rows, rec)
+	}
+	for _, id := range []domain.SessionID{"live-1", "live-2", "crashed"} {
+		rows = append(rows, handledSession(id))
+		alive["h-"+string(id)] = id != "crashed"
+	}
+	r := New(lcm, fakeSessions{rows: rows}, perHandleRuntime{alive: alive}, Config{Logger: quietLogger()})
+	if err := r.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []domain.SessionID{"stopped-1", "stopped-2", "stopped-3", "stopped-4", "stopped-5"} {
+		if got, probed := lcm.observed[id]; probed {
+			t.Fatalf("released session %s was probed: %+v", id, got)
+		}
+	}
+	if got := lcm.observed["crashed"]; got.Runtime != ports.ProbeDead {
+		t.Fatalf("crashed runtime = %q, want %q (stopped sessions must not trip the breaker)", got.Runtime, ports.ProbeDead)
+	}
+}
+
 // Small boards never trip the breaker: two agents finishing together is
 // normal, and both are genuinely dead.
 func TestTick_SmallBoardMassDeathStillConcludes(t *testing.T) {
@@ -263,54 +295,5 @@ func TestTick_WarnsOnlyOnceForSessionWithoutHandle(t *testing.T) {
 		if got := strings.Count(logs.String(), "session="+string(id)); got != 1 {
 			t.Fatalf("warning count for %s = %d, want 1; logs:\n%s", id, got, logs.String())
 		}
-	}
-}
-
-type signalingLCM struct{ observed chan domain.SessionID }
-
-func (l signalingLCM) ApplyRuntimeObservation(_ context.Context, id domain.SessionID, _ ports.RuntimeFacts) error {
-	select {
-	case l.observed <- id:
-	default:
-	}
-	return nil
-}
-
-// A runtime that died across a daemon restart belongs to boot reconciliation
-// until it has relaunched or preserved the session (#6200): the periodic loop
-// must not observe it before the daemon releases the reaper.
-func TestStart_WaitsForReadyBeforeTicking(t *testing.T) {
-	lcm := signalingLCM{observed: make(chan domain.SessionID, 16)}
-	ready := make(chan struct{})
-	runCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	sessions := fakeSessions{rows: []domain.SessionRecord{probableSession("mer-1")}}
-	r := New(lcm, sessions, fakeRuntime{}, Config{Tick: time.Millisecond, Logger: quietLogger(), Ready: ready})
-	done := r.Start(runCtx)
-
-	select {
-	case <-lcm.observed:
-		t.Fatal("reaper observed a session before boot recovery released it")
-	case <-time.After(50 * time.Millisecond):
-	}
-	close(ready)
-	select {
-	case <-lcm.observed:
-	case <-time.After(2 * time.Second):
-		t.Fatal("reaper did not tick after it was released")
-	}
-	cancel()
-	<-done
-}
-
-func TestStart_UnreleasedReaperStopsOnCancel(t *testing.T) {
-	runCtx, cancel := context.WithCancel(context.Background())
-	r := New(&fakeLCM{}, fakeSessions{}, fakeRuntime{}, Config{Logger: quietLogger(), Ready: make(chan struct{})})
-	done := r.Start(runCtx)
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("unreleased reaper loop did not exit on cancellation")
 	}
 }

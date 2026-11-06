@@ -9,6 +9,11 @@ import { TanStackRouterVite } from "@tanstack/router-plugin/vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { DEFAULT_POSTHOG_HOST } from "./src/shared/posthog-config";
+import { parseTeamsFlag } from "./src/shared/teams-flag";
+
+// Read once, when the renderer is built or served: a value that is neither
+// "on" nor "off" stops here instead of shipping a build that guessed.
+const TEAMS_FLAG = parseTeamsFlag(process.env.VITE_AO_TEAMS);
 
 const POSTHOG_ORIGINS = (() => {
 	const configured = process.env.VITE_AO_POSTHOG_HOST?.trim() || DEFAULT_POSTHOG_HOST;
@@ -112,9 +117,11 @@ const CLOUD_CP_WS_ORIGINS = CLOUD_CP_ORIGINS.map((origin) => origin.replace(/^ht
 export function contentSecurityPolicy(mode: "build" | "serve"): string {
 	return [
 		"default-src 'self'",
-		// react-refresh injects its inline preamble in serve mode; a hash is
-		// impractical because the preamble changes with the plugin version.
-		mode === "serve" ? "script-src 'self' 'unsafe-inline'" : "script-src 'self'",
+		// 'wasm-unsafe-eval' lets @pierre/highlights compile its WebAssembly module;
+		// it does not permit JS eval. react-refresh injects its inline preamble in
+		// serve mode; a hash is impractical because the preamble changes with the
+		// plugin version.
+		mode === "serve" ? "script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'" : "script-src 'self' 'wasm-unsafe-eval'",
 		"style-src 'self' 'unsafe-inline'",
 		// Repository avatars can come from self-hosted SCM instances whose origins
 		// are only known at runtime. Keep the broad exception limited to images;
@@ -198,6 +205,7 @@ export default defineConfig({
 		"import.meta.env.VITE_AO_GIT_COMMIT": JSON.stringify(DEV_BUILD_INFO.commit),
 		"import.meta.env.VITE_AO_GIT_WORKTREE": JSON.stringify(DEV_BUILD_INFO.worktree),
 		"import.meta.env.VITE_AO_GIT_DIRTY": JSON.stringify(String(DEV_BUILD_INFO.isDirty)),
+		"import.meta.env.VITE_AO_TEAMS": JSON.stringify(TEAMS_FLAG),
 	},
 	// "@/" → the renderer root (src/renderer), the shadcn/ui import convention.
 	resolve: {

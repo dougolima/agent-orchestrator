@@ -47,6 +47,7 @@ export function buildShortcutCommands(t: TFunction): CommandItem[] {
 		title: t(shortcutLabelKeys[id]),
 		keywords,
 		searchOnly: true,
+		shortcut: id,
 		action: { kind: "run-shortcut", shortcut: id },
 	}));
 }
@@ -79,6 +80,7 @@ const SETTINGS_ENTRIES: SettingsEntry[] = [
 	{ id: "transparency", section: "general", label: "settings.windowTranslucency", keywords: ["translucency", "vibrancy", "blur"] },
 	{ id: "render-math", section: "general", label: "settings.renderMath", keywords: ["latex", "katex", "equations", "formulas", "tex"] },
 	{ id: "session-interface", section: "general", label: "settings.sessionInterface.label", keywords: ["chat or terminal", "default view"] },
+	{ id: "default-editor", section: "general", label: "settings.defaultEditor.label", keywords: ["preferred editor", "open in editor", "ide", "vscode"] },
 	{ id: "version-refresh", section: "general", label: "settings.versionRefresh.label", keywords: ["auto upgrade sessions", "version refresh"] },
 	{ id: "terminal-shell", section: "general", label: "settings.terminalShell.label", keywords: ["zsh", "bash", "fish", "powershell", "shell path"] },
 	{ id: "copy-on-select", section: "general", label: "settings.terminalCopyOnSelect", keywords: ["terminal copy", "selection", "clipboard"] },
@@ -89,7 +91,8 @@ const SETTINGS_ENTRIES: SettingsEntry[] = [
 	{ id: "error-events", section: "general", label: "settings.telemetryEvents.label", keywords: ["crash reports", "sentry", "telemetry"] },
 	{ id: "developer-mode", section: "general", label: "settings.developerMode", keywords: ["advanced", "debug"] },
 	{ id: "side-chats", section: "general", label: "settings.sideChats", keywords: ["side chat", "secondary chat"] },
-	{ id: "cloud", section: "general", label: "settings.cloud", keywords: ["ao cloud", "enable cloud"] },
+	{ id: "new-sidebar-design", section: "general", label: "settings.newSidebarDesign", keywords: ["sidebar", "old sidebar", "status icons", "hover preview"] },
+	{ id: "simplified-topbar", section: "general", label: "settings.simplifiedTopbar", keywords: ["top bar", "topbar", "toolbar", "floating", "tabs"] },
 	{ id: "cli-link", section: "general", label: "settings.cliLink.label", keywords: ["cli", "terminal command", "path", "install"] },
 	{ id: "accounts", section: "agents", label: "settings.agents", keywords: [] },
 	{ id: "add-account", section: "agents", label: "settings.codexAccounts.add", keywords: ["sign in"] },

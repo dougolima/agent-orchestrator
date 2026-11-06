@@ -4,6 +4,7 @@ import { isCancelledError } from "@tanstack/react-query";
 import type { QueryClient } from "@tanstack/react-query";
 import { DaemonStartupLoader } from "./components/DaemonStartupLoader";
 import { routeTree } from "./routeTree.gen";
+import { reportRouteError } from "./components/RouteErrorCapture";
 
 export function AppPendingFallback() {
 	const isInitialLoad = useRouterState({ select: (state) => state.resolvedLocation === undefined });
@@ -28,6 +29,7 @@ export function createAppRouter(queryClient: QueryClient) {
 		history: createHashHistory(),
 		routeTree,
 		context: { queryClient },
+		defaultOnCatch: reportRouteError,
 		defaultPreload: "intent",
 		// Parent route loaders probe the daemon before ShellLayout can mount.
 		// Render the same viewport-wide startup screen during that gap so the

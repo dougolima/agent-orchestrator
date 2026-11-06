@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -508,145 +510,6 @@ func TestObserve_CIStates(t *testing.T) {
 				t.Fatalf("CI = %q, want %q", obs.CI, tc.wantCI)
 			}
 		})
-	}
-}
-
-func TestCIProjectionsIgnoreSupersededCancelledWorkflowRun(t *testing.T) {
-	pr := prWithCheckRuns("FAILURE",
-		workflowCheckRun("build-test", "CANCELLED", 301525012, 5585, 1, 104658065945),
-		workflowCheckRun("build-test", "SUCCESS", 301525012, 5586, 1, 104658070883),
-	)
-
-	if got := githubCIProjectionFromGraphQL(pr).summary(); got != domain.CIPassing {
-		t.Fatalf("direct CI summary = %q, want %q", got, domain.CIPassing)
-	}
-	obs := scmObservationFromGraphQL(ports.SCMPRRef{}, pr)
-	if obs.CI.Summary != string(domain.CIPassing) {
-		t.Fatalf("observer CI summary = %q, want %q", obs.CI.Summary, domain.CIPassing)
-	}
-	if len(obs.CI.Checks) != 1 || obs.CI.Checks[0].ProviderID != "104658070883" {
-		t.Fatalf("observer checks = %+v, want only the newer successful occurrence", obs.CI.Checks)
-	}
-	if len(obs.CI.FailedChecks) != 0 {
-		t.Fatalf("observer failed checks = %+v, want none", obs.CI.FailedChecks)
-	}
-}
-
-func TestCIProjectionsKeepLatestCancelledWorkflowRun(t *testing.T) {
-	pr := prWithCheckRuns("FAILURE",
-		workflowCheckRun("build-test", "SUCCESS", 301525012, 5585, 1, 104658065945),
-		workflowCheckRun("build-test", "CANCELLED", 301525012, 5586, 1, 104658070883),
-	)
-
-	if got := githubCIProjectionFromGraphQL(pr).summary(); got != domain.CIFailing {
-		t.Fatalf("direct CI summary = %q, want %q", got, domain.CIFailing)
-	}
-	obs := scmObservationFromGraphQL(ports.SCMPRRef{}, pr)
-	if obs.CI.Summary != string(domain.CIFailing) {
-		t.Fatalf("observer CI summary = %q, want %q", obs.CI.Summary, domain.CIFailing)
-	}
-	if len(obs.CI.Checks) != 1 || obs.CI.Checks[0].ProviderID != "104658070883" {
-		t.Fatalf("observer checks = %+v, want only the newer cancelled occurrence", obs.CI.Checks)
-	}
-	if len(obs.CI.FailedChecks) != 1 || obs.CI.FailedChecks[0].ProviderID != "104658070883" {
-		t.Fatalf("observer failed checks = %+v, want the current cancellation", obs.CI.FailedChecks)
-	}
-}
-
-func TestCIProjectionsKeepSameNamedJobsFromDifferentWorkflows(t *testing.T) {
-	pr := prWithCheckRuns("FAILURE",
-		workflowCheckRun("build", "SUCCESS", 100, 20, 1, 9001),
-		workflowCheckRun("build", "CANCELLED", 200, 3, 1, 9002),
-	)
-
-	obs := scmObservationFromGraphQL(ports.SCMPRRef{}, pr)
-	if obs.CI.Summary != string(domain.CIFailing) {
-		t.Fatalf("observer CI summary = %q, want %q", obs.CI.Summary, domain.CIFailing)
-	}
-	if len(obs.CI.Checks) != 2 {
-		t.Fatalf("observer checks = %+v, want both workflows preserved", obs.CI.Checks)
-	}
-	if len(obs.CI.FailedChecks) != 1 || obs.CI.FailedChecks[0].ProviderID != "9002" {
-		t.Fatalf("observer failed checks = %+v, want cancellation from the second workflow", obs.CI.FailedChecks)
-	}
-}
-
-func TestCIProjectionsUseLatestWorkflowRunAttempt(t *testing.T) {
-	pr := prWithCheckRuns("FAILURE",
-		workflowCheckRun("lint", "CANCELLED", 301525012, 5586, 1, 9001),
-		workflowCheckRun("lint", "SUCCESS", 301525012, 5586, 2, 9002),
-	)
-
-	if got := githubCIProjectionFromGraphQL(pr).summary(); got != domain.CIPassing {
-		t.Fatalf("direct CI summary = %q, want %q", got, domain.CIPassing)
-	}
-	obs := scmObservationFromGraphQL(ports.SCMPRRef{}, pr)
-	if obs.CI.Summary != string(domain.CIPassing) || len(obs.CI.FailedChecks) != 0 {
-		t.Fatalf("observer CI = %+v, want passing with no failed checks", obs.CI)
-	}
-}
-
-func TestGitHubCIProjectionUsesOneEffectiveCheckSet(t *testing.T) {
-	pr := prWithCheckRuns("FAILURE",
-		workflowCheckRun("build", "CANCELLED", 301525012, 5585, 1, 9001),
-		workflowCheckRun("build", "SUCCESS", 301525012, 5586, 1, 9002),
-		workflowCheckRun("lint", "CANCELLED", 301525012, 5586, 1, 9003),
-	)
-
-	projection := githubCIProjectionFromGraphQL(pr)
-	if got := projection.summary(); got != domain.CIFailing {
-		t.Fatalf("summary = %q, want %q", got, domain.CIFailing)
-	}
-	checks := projection.scmChecks()
-	if len(checks) != 2 {
-		t.Fatalf("checks = %+v, want the current build and lint checks", checks)
-	}
-	failed := projection.failedSCMChecks()
-	if len(failed) != 1 || failed[0].ProviderID != "9003" {
-		t.Fatalf("failed checks = %+v, want only current lint cancellation", failed)
-	}
-	if got := projection.jobID("build"); got != 9002 {
-		t.Fatalf("build job id = %d, want current successful build job 9002", got)
-	}
-	if got := projection.jobID("lint"); got != 9003 {
-		t.Fatalf("lint job id = %d, want current cancelled lint job 9003", got)
-	}
-}
-
-func prWithCheckRuns(rollupState string, checks ...any) map[string]any {
-	return map[string]any{
-		"commits": map[string]any{"nodes": []any{
-			map[string]any{"commit": map[string]any{
-				"oid": "deadbeef",
-				"statusCheckRollup": map[string]any{
-					"state": rollupState,
-					"contexts": map[string]any{
-						"nodes":    checks,
-						"pageInfo": map[string]any{"hasNextPage": false},
-					},
-				},
-			}},
-		}},
-	}
-}
-
-func workflowCheckRun(name, conclusion string, workflowID, runNumber, runAttempt, checkID int) map[string]any {
-	return map[string]any{
-		"__typename": "CheckRun",
-		"name":       name,
-		"status":     "COMPLETED",
-		"conclusion": conclusion,
-		"detailsUrl": fmt.Sprintf("https://github.com/acme/repo/actions/runs/%d/job/%d", runNumber, checkID),
-		"databaseId": float64(checkID),
-		"checkSuite": map[string]any{
-			"workflowRun": map[string]any{
-				"runNumber":  float64(runNumber),
-				"runAttempt": float64(runAttempt),
-				"workflow": map[string]any{
-					"databaseId": float64(workflowID),
-				},
-			},
-		},
 	}
 }
 
@@ -1409,6 +1272,117 @@ func TestSCMObservationUsesRollupStateWhenContextsPaginated(t *testing.T) {
 	}
 }
 
+func actionsCheckRun(workflow, name, conclusion string, id float64) map[string]any {
+	n := map[string]any{"__typename": "CheckRun", "name": name, "status": "COMPLETED", "conclusion": conclusion, "databaseId": id}
+	if workflow != "" {
+		n["checkSuite"] = map[string]any{"workflowRun": map[string]any{"event": "pull_request", "workflow": map[string]any{"name": workflow}}}
+	}
+	return n
+}
+
+// PR #7774: the same commit ran each workflow three times; the first run was
+// cancelled, and GitHub's rollup state stays FAILURE although every check's
+// newest run passed.
+func TestCISummaryIgnoresSupersededCheckRuns(t *testing.T) {
+	superseded := []any{
+		actionsCheckRun("Go", "lint", "CANCELLED", 1),
+		actionsCheckRun("Go", "build-test", "FAILURE", 2),
+		actionsCheckRun("CLI E2E", "native (ubuntu-latest)", "CANCELLED", 3),
+		actionsCheckRun("Go", "lint", "SUCCESS", 10),
+		actionsCheckRun("Go", "build-test", "SUCCESS", 11),
+		actionsCheckRun("CLI E2E", "native (ubuntu-latest)", "SUCCESS", 12),
+	}
+	cases := []struct {
+		name       string
+		nodes      []any
+		wantCI     domain.CIState
+		wantChecks int
+		wantFailed []string
+	}{
+		{name: "only superseded runs failed", nodes: superseded, wantCI: domain.CIPassing, wantChecks: 3},
+		{
+			name:       "same job name in another workflow still fails",
+			nodes:      append(slices.Clone(superseded), actionsCheckRun("Frontend", "lint", "FAILURE", 4)),
+			wantCI:     domain.CIFailing,
+			wantChecks: 4,
+			wantFailed: []string{"lint"},
+		},
+		{
+			name: "runs without a workflow are never merged",
+			nodes: []any{
+				actionsCheckRun("", "external", "FAILURE", 1),
+				actionsCheckRun("", "external", "SUCCESS", 2),
+			},
+			wantCI:     domain.CIFailing,
+			wantChecks: 2,
+			wantFailed: []string{"external"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var pr map[string]any
+			basePRFixture().prData(func(m map[string]any) {
+				pr = m
+				commit := m["commits"].(map[string]any)["nodes"].([]any)[0].(map[string]any)["commit"].(map[string]any)
+				roll := commit["statusCheckRollup"].(map[string]any)
+				roll["state"] = "FAILURE"
+				roll["contexts"] = map[string]any{"nodes": tc.nodes, "pageInfo": map[string]any{"hasNextPage": false}}
+			})
+			if got := ciSummaryFromGraphQL(pr); got != tc.wantCI {
+				t.Fatalf("ciSummaryFromGraphQL = %q, want %q", got, tc.wantCI)
+			}
+			obs := scmObservationFromGraphQL(ports.SCMPRRef{Repo: ports.SCMRepo{Provider: "github", Host: "github.com", Owner: "octocat", Name: "hello", Repo: "octocat/hello"}, Number: 42}, pr)
+			if obs.CI.Summary != string(tc.wantCI) {
+				t.Fatalf("observer CI summary = %q, want %q", obs.CI.Summary, tc.wantCI)
+			}
+			if len(obs.CI.Checks) != tc.wantChecks {
+				t.Fatalf("checks = %#v, want %d", obs.CI.Checks, tc.wantChecks)
+			}
+			var failed []string
+			for _, ch := range obs.CI.FailedChecks {
+				failed = append(failed, ch.Name)
+			}
+			if !slices.Equal(failed, tc.wantFailed) {
+				t.Fatalf("failed checks = %v, want %v", failed, tc.wantFailed)
+			}
+			if tc.wantCI == domain.CIPassing && obs.CI.FailedFingerprint != "" {
+				t.Fatalf("failed fingerprint = %q, want empty so no CI-failure nudge fires", obs.CI.FailedFingerprint)
+			}
+		})
+	}
+}
+
+// A token without Actions read access gets FORBIDDEN on each
+// checkSuite.workflowRun; the PR must still be observed.
+func TestFetchPullRequestsToleratesWorkflowRunAccessErrors(t *testing.T) {
+	fake := newFakeGH(t)
+	var pr map[string]any
+	basePRFixture().prData(func(m map[string]any) { pr = m })
+	fake.on(http.MethodPost, "/graphql", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), "checkSuite{ workflowRun{ event workflow{ name } } }") {
+			t.Fatalf("batch query should request each check run's workflow, body=%s", body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{"pr0": map[string]any{"pullRequest": pr}},
+			"errors": []any{map[string]any{
+				"type":    "FORBIDDEN",
+				"message": "Resource not accessible by integration",
+				"path":    []any{"pr0", "pullRequest", "commits", "nodes", 0, "commit", "statusCheckRollup", "contexts", "nodes", 0, "checkSuite", "workflowRun"},
+			}},
+		})
+	})
+	p := newProviderForTest(t, fake)
+	obs, err := p.FetchPullRequests(ctx(), []ports.SCMPRRef{{Repo: ports.SCMRepo{Provider: "github", Host: "github.com", Owner: "octocat", Name: "hello", Repo: "octocat/hello"}, Number: 42}})
+	if err != nil {
+		t.Fatalf("FetchPullRequests: %v", err)
+	}
+	if len(obs) != 1 || !obs[0].Fetched || obs[0].CI.Summary != string(domain.CIPassing) {
+		t.Fatalf("observation = %#v", obs)
+	}
+}
+
 func TestSCMBatchQueryRequestsStablePullRequestID(t *testing.T) {
 	query, _ := buildSCMBatchQuery([]ports.SCMPRRef{{
 		Repo:   ports.SCMRepo{Provider: "github", Host: "github.com", Owner: "octocat", Name: "hello"},
@@ -1416,15 +1390,6 @@ func TestSCMBatchQueryRequestsStablePullRequestID(t *testing.T) {
 	}})
 	if !strings.Contains(query, "number id url") {
 		t.Fatalf("batch query does not request the stable pull request id:\n%s", query)
-	}
-	if !strings.Contains(query, "checkSuite{ workflowRun{ runNumber runAttempt workflow{ databaseId } } }") {
-		t.Fatalf("batch query does not request workflow run identity:\n%s", query)
-	}
-}
-
-func TestPRObservationQueryRequestsWorkflowRunIdentity(t *testing.T) {
-	if !strings.Contains(prObservationQuery, "checkSuite{ workflowRun{ runNumber runAttempt workflow{ databaseId } } }") {
-		t.Fatalf("PR observation query does not request workflow run identity:\n%s", prObservationQuery)
 	}
 }
 
@@ -1574,9 +1539,6 @@ func TestFetchPullRequestsFetchesRemainingCheckContexts(t *testing.T) {
 		case 2:
 			if !strings.Contains(string(body), `after:\"cursor-1\"`) && !strings.Contains(string(body), `after:"cursor-1"`) {
 				t.Fatalf("fallback query missing cursor, body=%s", body)
-			}
-			if !strings.Contains(string(body), "checkSuite") || !strings.Contains(string(body), "runAttempt") {
-				t.Fatalf("fallback query missing workflow run identity, body=%s", body)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"data": map[string]any{"repo": map[string]any{"pullRequest": map[string]any{
@@ -2080,5 +2042,37 @@ func TestMergeabilityObservation_UnstableOutranksBlockers(t *testing.T) {
 				t.Fatalf("Blockers = %v, want %v", got.Blockers, tc.wantBlockers)
 			}
 		})
+	}
+}
+
+// A branch lookup asks GitHub to filter by head owner:branch in one request,
+// so a repository's other open PRs are never paged through. It keeps each
+// PR's author, which decides whether AO may attach it.
+func TestListOpenPRsByBranchFiltersOnTheServer(t *testing.T) {
+	f := newFakeGH(t)
+	var query url.Values
+	f.on(http.MethodGet, "/repos/acme/repo/pulls", func(w http.ResponseWriter, r *http.Request) {
+		query = r.URL.Query()
+		_ = json.NewEncoder(w).Encode([]map[string]any{{
+			"number": 7, "html_url": "https://github.com/acme/repo/pull/7", "state": "open",
+			"user": map[string]any{"login": "alice"},
+			"head": map[string]any{"ref": "ao/x/fix", "repo": map[string]any{"full_name": "acme/repo"}},
+			"base": map[string]any{"ref": "main", "repo": map[string]any{"full_name": "acme/repo"}},
+		}})
+	})
+	p := newProviderForTest(t, f)
+
+	prs, err := p.ListOpenPRsByBranch(ctx(), ports.SCMRepo{Provider: "github", Owner: "acme", Name: "repo", Repo: "acme/repo"}, "ao/x/fix")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if query.Get("head") != "acme:ao/x/fix" || query.Get("state") != "open" {
+		t.Fatalf("query = %v, want head=acme:ao/x/fix state=open", query)
+	}
+	if len(prs) != 1 || prs[0].HTMLURL != "https://github.com/acme/repo/pull/7" || prs[0].SourceBranch != "ao/x/fix" || prs[0].Author != "alice" {
+		t.Fatalf("prs = %+v", prs)
+	}
+	if n := f.callsTo(http.MethodGet, "/repos/acme/repo/pulls"); n != 1 {
+		t.Fatalf("list requests = %d, want 1", n)
 	}
 }

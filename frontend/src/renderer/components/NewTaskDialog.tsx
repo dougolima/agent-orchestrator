@@ -1,3 +1,4 @@
+import { apiErrorException } from "../lib/api-error-exception";
 import * as Dialog from "@radix-ui/react-dialog";
 import { useQueries } from "@tanstack/react-query";
 import { StickyNote } from "lucide-react";
@@ -6,36 +7,11 @@ import { useUiStore } from "../stores/ui-store";
 import { useTranslation } from "react-i18next";
 import { useRemoteWorkspaces, useWorkspaceQuery } from "../hooks/useWorkspaceQuery";
 import { labelForHost } from "../lib/host-clients";
-import { apiClient, apiErrorMessage } from "../lib/api-client";
+import { apiClient } from "../lib/api-client";
 import { TaskComposer } from "./TaskComposer";
 import { CLOUD_PROJECT_KIND, STANDALONE_WORKSPACE_ID } from "../types/workspace";
 import { SettingsOptionMenu } from "./settings/SettingsOptionMenu";
-
-function repositoryOwnerAvatar(repo: string): { owner: string; url: string } | null {
-	const value = repo.trim();
-	const scp = value.match(/^[^/@:\s]+@([^/:\s]+):(.+)$/);
-	let host: string;
-	let pathname: string;
-	if (scp?.[1] && scp[2]) {
-		host = scp[1].toLowerCase();
-		pathname = scp[2];
-	} else {
-		try {
-			const parsed = new URL(value.includes("://") ? value : `https://${value}`);
-			host = parsed.hostname.toLowerCase();
-			pathname = parsed.pathname;
-		} catch {
-			return null;
-		}
-	}
-	const owner = pathname.replace(/^\/+|\/+$/g, "").split("/")[0]?.replace(/\.git$/, "");
-	if (!owner) return null;
-	const encodedOwner = encodeURIComponent(owner);
-	if (host === "github.com") return { owner, url: `https://github.com/${encodedOwner}.png?size=64` };
-	if (host === "gitlab.com") return { owner, url: `https://gitlab.com/-/avatar?username=${encodedOwner}` };
-	if (host === "bitbucket.org") return { owner, url: `https://bitbucket.org/account/${encodedOwner}/avatar/64/` };
-	return { owner, url: `https://unavatar.io/${encodeURIComponent(host)}/${encodedOwner}` };
-}
+import { repositoryOwnerAvatar } from "../lib/repository-avatar";
 
 function ProjectOwnerAvatar({ avatar, className }: { avatar: { owner: string; url: string }; className: string }) {
 	return (
@@ -83,7 +59,7 @@ export function NewTaskDialog({ open, projectId, hostId, onProjectChange, onCrea
 				const { data, error } = await apiClient.GET("/api/v1/projects/{id}", {
 					params: { path: { id: project.id } },
 				});
-				if (error) throw new Error(apiErrorMessage(error));
+				if (error) throw apiErrorException(error);
 				if (data?.status !== "ok") return undefined;
 				return data.project;
 			},
@@ -127,7 +103,7 @@ export function NewTaskDialog({ open, projectId, hostId, onProjectChange, onCrea
 		<Dialog.Root open={open && !settingsOpen} onOpenChange={onOpenChange}>
 			<Dialog.Portal>
 				<Dialog.Overlay className="dialog-overlay data-[state=open]:animate-overlay-in data-[state=closed]:animate-overlay-out" />
-				<Dialog.Content className="fixed left-1/2 top-1/2 z-overlay w-dialog-xl -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-lg border border-(--color-border-overlay) bg-popover p-0 text-popover-foreground shadow-(--shadow-popover) data-[state=open]:animate-modal-in data-[state=closed]:animate-modal-out motion-reduce:animate-none">
+				<Dialog.Content className="fixed left-1/2 top-1/2 z-overlay w-dialog-xl -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-lg border border-(--color-border-overlay) overlay-glass p-0 text-foreground shadow-(--shadow-popover) data-[state=open]:animate-modal-in data-[state=closed]:animate-modal-out motion-reduce:animate-none">
 					{/* The selected project is the dialog title; the composer remains the main surface. */}
 					<Dialog.Title className="settings-dialog-title flex flex-wrap items-center gap-x-1.5 px-3 pt-3">
 						<SettingsOptionMenu
