@@ -2,7 +2,7 @@ import { useQueries } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { apiClient } from "../lib/api-client";
 import { apiErrorException } from "../lib/api-error-exception";
-import { repositoryOwnerAvatar } from "../lib/repository-avatar";
+import { githubProfileAvatarUrl, repositoryOwnerAvatar } from "../lib/repository-avatar";
 import { useUiStore } from "../stores/ui-store";
 import { isNewSidebarDesign } from "../lib/new-sidebar-design";
 import { CLOUD_PROJECT_KIND, STANDALONE_PROJECT_KIND, type WorkspaceSummary } from "../types/workspace";
@@ -38,22 +38,37 @@ function readCache(): AvatarCache {
 	return Object.fromEntries(Object.entries(readStrings(cacheKey)).filter(([, src]) => src.startsWith("data:image/")));
 }
 
+// Avatar URL -> the address shown instead, for a GitHub owner whose by-name
+// avatar is the generic placeholder (see githubProfileAvatarUrl).
+const fallbacksKey = "ao.projectAvatarFallbacks";
+
+function readFallbacks(): Record<string, string> {
+	return Object.fromEntries(Object.entries(readStrings(fallbacksKey)).filter(([, src]) => src.startsWith("https://github.com/")));
+}
+
+const AVATAR_SIZE = 64;
+
+type AvatarLoad = { src: string } | { placeholder: true } | null;
+
 // Draws the avatar through a CORS image and a canvas. Loading it as an image
 // keeps it under the renderer's img-src policy (fetch would need connect-src),
 // and a redirect to a sign-in page fails to decode instead of being cached.
-function loadAsDataUrl(url: string): Promise<string | null> {
+export function loadAvatar(url: string): Promise<AvatarLoad> {
 	return new Promise((resolve) => {
 		const image = new Image();
 		image.crossOrigin = "anonymous";
 		image.onload = () => {
+			// GitHub resizes a real avatar to the size the URL asks for; the
+			// placeholder it serves instead arrives at its full size.
+			if (githubProfileAvatarUrl(url) && image.naturalWidth > AVATAR_SIZE) return resolve({ placeholder: true });
 			try {
 				const canvas = document.createElement("canvas");
-				canvas.width = 64;
-				canvas.height = 64;
+				canvas.width = AVATAR_SIZE;
+				canvas.height = AVATAR_SIZE;
 				const context = canvas.getContext("2d");
 				if (!context) return resolve(null);
-				context.drawImage(image, 0, 0, 64, 64);
-				resolve(canvas.toDataURL("image/png"));
+				context.drawImage(image, 0, 0, AVATAR_SIZE, AVATAR_SIZE);
+				resolve({ src: canvas.toDataURL("image/png") });
 			} catch {
 				resolve(null);
 			}
@@ -61,6 +76,11 @@ function loadAsDataUrl(url: string): Promise<string | null> {
 		image.onerror = () => resolve(null);
 		image.src = url;
 	});
+}
+
+// Keeps only the entries for avatars still in use, so removed projects drop out.
+function keepCurrent(entries: Record<string, string>, current: Set<string>): Record<string, string> {
+	return Object.fromEntries(Object.entries(entries).filter(([url]) => current.has(url)));
 }
 
 // Refreshed once per launch, so an owner's new avatar replaces the cached one.
@@ -74,6 +94,7 @@ const refreshedUrls = new Set<string>();
 export function useProjectAvatars(workspaces: WorkspaceSummary[]): Map<string, string> {
 	const enabled = useUiStore((state) => state.projectAvatars && isNewSidebarDesign(state));
 	const [cache, setCache] = useState(readCache);
+	const [fallbacks, setFallbacks] = useState(readFallbacks);
 	const [knownUrls] = useState(() => readStrings(urlsKey));
 	const projects = useMemo(
 		() => workspaces.filter((workspace) => !workspace.hostId && workspace.kind !== CLOUD_PROJECT_KIND && workspace.kind !== STANDALONE_PROJECT_KIND),
@@ -130,13 +151,24 @@ export function useProjectAvatars(workspaces: WorkspaceSummary[]): Map<string, s
 		for (const url of current) {
 			if (refreshedUrls.has(url)) continue;
 			refreshedUrls.add(url);
-			void loadAsDataUrl(url).then((src) => {
-				if (!src) return;
+			void loadAvatar(url).then((result) => {
+				if (!result) return;
+				const fallback = "placeholder" in result ? githubProfileAvatarUrl(url) : null;
+				setFallbacks((previous) => {
+					if ((previous[url] ?? null) === fallback) return previous;
+					const next = keepCurrent(previous, current);
+					if (fallback) next[url] = fallback;
+					else delete next[url];
+					writeStrings(fallbacksKey, next);
+					return next;
+				});
+				// A placeholder is never cached, and one cached before is dropped.
+				const src = "src" in result ? result.src : undefined;
 				setCache((previous) => {
 					if (previous[url] === src) return previous;
-					// Keep only avatars still in use, so removed projects drop out.
-					const next: AvatarCache = { [url]: src };
-					for (const [key, value] of Object.entries(previous)) if (current.has(key) && key !== url) next[key] = value;
+					const next: AvatarCache = keepCurrent(previous, current);
+					if (src) next[url] = src;
+					else delete next[url];
 					writeStrings(cacheKey, next);
 					return next;
 				});
@@ -147,7 +179,7 @@ export function useProjectAvatars(workspaces: WorkspaceSummary[]): Map<string, s
 	return useMemo(() => {
 		const map = new Map<string, string>();
 		if (!enabled) return map;
-		for (const [projectId, url] of urls) map.set(projectId, cache[url] ?? url);
+		for (const [projectId, url] of urls) map.set(projectId, fallbacks[url] ?? cache[url] ?? url);
 		return map;
-	}, [cache, enabled, urls]);
+	}, [cache, enabled, fallbacks, urls]);
 }

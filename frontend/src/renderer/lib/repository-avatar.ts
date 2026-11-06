@@ -27,3 +27,23 @@ export function repositoryOwnerAvatar(repo: string): { owner: string; url: strin
 	// sending it to a third-party lookup would leak internal host and org names.
 	return null;
 }
+
+/**
+ * The github.com/<owner>.png address for a by-name GitHub avatar URL, or null
+ * for any other URL. GitHub serves some organizations' avatars only by account
+ * id: the by-name URL answers with its generic placeholder, while
+ * github.com/<owner>.png redirects to the id URL. That redirect carries no
+ * CORS header, so the image shows in an <img> but cannot be cached.
+ */
+export function githubProfileAvatarUrl(avatarUrl: string): string | null {
+	let parsed: URL;
+	try {
+		parsed = new URL(avatarUrl);
+	} catch {
+		return null;
+	}
+	if (parsed.hostname !== "avatars.githubusercontent.com") return null;
+	const owner = parsed.pathname.replace(/^\/+/, "");
+	if (!owner || owner.includes("/")) return null;
+	return `https://github.com/${owner}.png?size=64`;
+}
