@@ -308,6 +308,9 @@ func telemetryEmitsSpawned(cfg config.Config) bool {
 // It also returns the manager so the caller can wire Reconcile into the boot
 // sequence.
 func startSession(ctx context.Context, cfg config.Config, runtime runtimeselect.Runtime, store *sqlite.Store, lcm *lifecycle.Manager, artifactVersions *artifactversions.Capturer, messenger ports.AgentMessenger, telemetry ports.EventSink, notifications notificationSink, agents ports.AgentResolver, agentReadiness ports.AgentReadinessProvider, previewLifecycle sessionmanager.PreviewLifecycle, browserLifecycle sessionmanager.BrowserLifecycle, browserCapabilities sessionmanager.BrowserCapabilityIssuer, chat sessionmanager.ChatLauncher, reviewerRecoveryDone <-chan struct{}, defaults sessionmanager.SessionModeDefaults, tracker ports.Tracker, codexOperationGate ports.CodexOperationGate, reviewers *reviewer.Resolver, reviewRefresher reviewsvc.ThreadRefresher, log *slog.Logger) (*sessionsvc.Service, reviewsvc.Manager, sessionLifecycle, error) {
+	// A worktree left behind by a deleted session must not be handed to the
+	// next session that draws the same number.
+	store.SetSessionIDOccupied(sessionWorkspaceOccupied(filepath.Join(cfg.DataDir, "worktrees")))
 	gitWS, err := gitworktree.New(gitworktree.Options{
 		// Per-session worktrees live under the data dir, so a single AO_DATA_DIR
 		// override moves all durable per-user state together.

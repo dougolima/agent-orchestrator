@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/gen"
 )
 
@@ -24,6 +25,15 @@ type Store struct {
 	qr                    *gen.Queries // bound to the reader pool
 	writeMu               *contextMutex
 	usageTelemetryAllowed func() bool
+	sessionIDOccupied     func(projectID domain.ProjectID, id domain.SessionID) bool
+}
+
+// SetSessionIDOccupied installs a check, before session services start, that
+// reports an id whose workspace path is already taken on disk (a worktree left
+// behind by an earlier session with the same number). New sessions skip such
+// ids instead of colliding with the leftover directory.
+func (s *Store) SetSessionIDOccupied(occupied func(projectID domain.ProjectID, id domain.SessionID) bool) {
+	s.sessionIDOccupied = occupied
 }
 
 // SetUsageTelemetryAllowed installs the live consent check before session

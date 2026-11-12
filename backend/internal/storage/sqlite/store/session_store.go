@@ -128,7 +128,10 @@ func (s *Store) createSessionLocked(ctx context.Context, rec domain.SessionRecor
 		if err != nil {
 			return domain.SessionRecord{}, false, fmt.Errorf("check session id %s: %w", rec.ID, err)
 		}
-		if !exists {
+		// A number whose workspace directory survived its session (deleted
+		// before number floors existed, or removed outside AO) would make the
+		// new session fail to prepare its worktree, or silently adopt the old one.
+		if !exists && (s.sessionIDOccupied == nil || !s.sessionIDOccupied(rec.ProjectID, rec.ID)) {
 			break
 		}
 		num++
