@@ -13,6 +13,7 @@ import (
 	"math/big"
 	"path"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -76,14 +77,16 @@ type exactRates struct {
 }
 
 type providerSnapshot struct {
-	version string
-	models  map[string]exactRates
+	version     string
+	models      map[string]exactRates
+	longContext map[string][]int64
 }
 
 // Snapshot is an immutable, validated view of all provider catalogs. Its maps
 // and exact rational rates are never exposed or mutated after construction.
 type Snapshot struct {
 	providers map[string]providerSnapshot
+	overrides map[string]modelOverride
 }
 
 type decodedCatalog struct {
@@ -193,15 +196,16 @@ func validateRuntimeManifest(manifest catalogManifest) error {
 	if manifest.Source.Repository != "BerriAI/litellm" || manifest.Source.Path != "model_prices_and_context_window.json" || !sha40Pattern.MatchString(manifest.Source.Revision) {
 		return errors.New("invalid pricing manifest source")
 	}
-	wantProviders := []string{"anthropic", "openai", "zai"}
-	if len(manifest.Providers) != len(wantProviders) {
-		return fmt.Errorf("pricing manifest has %d providers, want %d", len(manifest.Providers), len(wantProviders))
-	}
-	for index, providerID := range wantProviders {
-		ref := manifest.Providers[index]
-		if ref.ProviderID != providerID || !sha256Pattern.MatchString(ref.SHA256) || ref.ModelCount < 1 {
+	listed := make(map[string]bool, len(manifest.Providers))
+	for index, ref := range manifest.Providers {
+		providerID := ref.ProviderID
+		if !ValidProviderID(providerID) || (index > 0 && providerID <= manifest.Providers[index-1].ProviderID) {
+			return fmt.Errorf("pricing manifest provider %q is invalid, duplicated, or out of order", providerID)
+		}
+		if !sha256Pattern.MatchString(ref.SHA256) || ref.ModelCount < 1 {
 			return fmt.Errorf("invalid pricing manifest provider %q", providerID)
 		}
+		listed[providerID] = true
 		wantPath := "providers/" + providerID + "/" + ref.SHA256 + ".json"
 		if ref.Path != wantPath || !safeProviderPath(ref.Path) {
 			return fmt.Errorf("provider %q has unsafe or invalid path %q", providerID, ref.Path)
@@ -209,6 +213,11 @@ func validateRuntimeManifest(manifest catalogManifest) error {
 		wantVersion := "ao-catalog:" + providerID + ":sha256:" + ref.SHA256
 		if ref.Version != wantVersion {
 			return fmt.Errorf("provider %q has invalid version", providerID)
+		}
+	}
+	for _, providerID := range RequiredProviderIDs {
+		if !listed[providerID] {
+			return fmt.Errorf("pricing manifest is missing provider %q", providerID)
 		}
 	}
 	return nil
@@ -235,6 +244,15 @@ func buildProviderSnapshot(blob catalogProviderBlob, ref catalogProviderRef) (pr
 			return providerSnapshot{}, fmt.Errorf("provider %q model %q: %w", ref.ProviderID, model.ModelID, err)
 		}
 		provider.models[canonicalID] = rates
+		if base, aboveK, ok := longContextThreshold(canonicalID); ok {
+			if provider.longContext == nil {
+				provider.longContext = make(map[string][]int64)
+			}
+			provider.longContext[base] = append(provider.longContext[base], aboveK)
+		}
+	}
+	for _, sizes := range provider.longContext {
+		sort.Slice(sizes, func(i, j int) bool { return sizes[i] > sizes[j] })
 	}
 	return provider, nil
 }
@@ -281,6 +299,19 @@ func parseRate(value string) (*big.Rat, error) {
 	return rate, nil
 }
 
+// ProviderIDs lists the providers this snapshot prices, in order.
+func (s *Snapshot) ProviderIDs() []string {
+	if s == nil {
+		return nil
+	}
+	ids := make([]string, 0, len(s.providers))
+	for providerID := range s.providers {
+		ids = append(ids, providerID)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 // ProviderVersion returns the exact active catalog version for a provider.
 func (s *Snapshot) ProviderVersion(providerID string) string {
 	if s == nil {
@@ -298,7 +329,16 @@ func (s *Snapshot) ProviderVersion(providerID string) string {
 var datedModelSuffix = regexp.MustCompile(`-\d{8}$`)
 
 // lookupRates resolves one model against one provider catalog, exactly first and
-// then without a trailing dated-snapshot suffix.
+// then without a trailing dated-snapshot suffix (see listedRow).
+func lookupRates(provider providerSnapshot, providerID, modelID string) (exactRates, bool) {
+	rates, ok := provider.models[provider.listedRow(CanonicalModelID(providerID, modelID))]
+	return rates, ok
+}
+
+// listedRow returns the catalog row this provider lists for rowID: rowID itself
+// when listed, otherwise the same row without a trailing dated-snapshot suffix
+// when that one is listed, otherwise rowID unchanged. A service-tier suffix
+// ("#priority") is kept on the undated candidate.
 //
 // The exact attempt has to win outright: catalogs list dated entries of their own
 // — claude-haiku-4-5-20251001 alongside claude-haiku-4-5 — and those carry their
@@ -309,17 +349,22 @@ var datedModelSuffix = regexp.MustCompile(`-\d{8}$`)
 // claude-opus-4-8) is listed undated only, so a dated id from the provider would
 // otherwise miss the catalog entirely and land unpriced under a model name the UI
 // renders as perfectly ordinary.
-func lookupRates(provider providerSnapshot, providerID, modelID string) (exactRates, bool) {
-	canonical := CanonicalModelID(providerID, modelID)
-	if rates, ok := provider.models[canonical]; ok {
-		return rates, true
+func (p providerSnapshot) listedRow(rowID string) string {
+	if _, ok := p.models[rowID]; ok {
+		return rowID
 	}
-	undated := datedModelSuffix.ReplaceAllString(canonical, "")
-	if undated == canonical {
-		return exactRates{}, false
+	base, tier, tiered := strings.Cut(rowID, "#")
+	undated := datedModelSuffix.ReplaceAllString(base, "")
+	if undated == base {
+		return rowID
 	}
-	rates, ok := provider.models[undated]
-	return rates, ok
+	if tiered {
+		undated += "#" + tier
+	}
+	if _, ok := p.models[undated]; ok {
+		return undated
+	}
+	return rowID
 }
 
 // ProviderForModel returns the one catalog provider that lists modelID, or ""
@@ -339,7 +384,11 @@ func (s *Snapshot) ProviderForModel(modelID string) string {
 		return ""
 	}
 	found := ""
-	for providerID, provider := range s.providers {
+	for _, providerID := range RequiredProviderIDs {
+		provider, ok := s.providers[providerID]
+		if !ok {
+			continue
+		}
 		// CanonicalModelID strips this provider's own prefix, so a stored
 		// "anthropic/claude-opus-5" still matches its unprefixed catalog entry.
 		if _, ok := lookupRates(provider, providerID, modelID); !ok {
@@ -359,12 +408,15 @@ func (s *Snapshot) ProviderForModel(modelID string) string {
 //
 // InputNanos covers every non-cache-read input charge. Cache writes are input
 // that happens to be written to the cache, so folding their charge in here is
-// what keeps the three components disjoint and additive.
+// what keeps the three components disjoint and additive. CacheWriteNanos is
+// the part of InputNanos that the cache writes cost, for reports that show it
+// apart; it is never added to the total again.
 type Estimate struct {
 	InputNanos       *int64
 	CachedInputNanos *int64
 	OutputNanos      *int64
 	TotalNanos       *int64
+	CacheWriteNanos  *int64
 	PricingVersion   string
 }
 
@@ -377,15 +429,32 @@ type cacheWriteSplit struct {
 	oneH  *int64
 }
 
-// Estimate prices one normalized usage event against this immutable snapshot.
+// Estimate prices one normalized usage event against this immutable snapshot, at the rates of the service tier that served it.
 func (s *Snapshot) Estimate(event domain.ModelUsageEvent) (Estimate, error) {
 	providerID := CanonicalProviderID(event.BillingProviderID)
+	modelID := CanonicalModelID(providerID, event.ModelID)
+	var override modelOverride
+	if s != nil {
+		override = s.overrides[event.ModelID]
+	}
+	if override.priceAs != "" {
+		providerID, modelID, _ = s.priceAsRow(override.priceAs)
+	}
+	tier, knownTier := catalogServiceTier(event.ProviderID, event.ServiceTier)
+	if tier != "" {
+		modelID = TierModelID(modelID, tier)
+	}
 	var rates exactRates
 	version := ""
-	if s != nil {
+	if override.rates != nil {
+		rates, version = *override.rates, override.version
+	} else if s != nil {
 		if provider, ok := s.providers[providerID]; ok {
 			version = provider.version
-			rates, _ = lookupRates(provider, providerID, event.ModelID)
+			modelID = provider.longContextRow(provider.listedRow(modelID), event.Tokens.InputTokens)
+			if knownTier {
+				rates = provider.models[modelID]
+			}
 		}
 	}
 	for _, value := range []*int64{
@@ -395,7 +464,7 @@ func (s *Snapshot) Estimate(event domain.ModelUsageEvent) (Estimate, error) {
 			return Estimate{}, errors.New("usage tokens must be nonnegative")
 		}
 	}
-	input, err := estimateInput(event, rates)
+	input, cacheWrite, err := estimateInput(event, rates)
 	if err != nil {
 		return Estimate{}, fmt.Errorf("input cost: %w", err)
 	}
@@ -407,7 +476,7 @@ func (s *Snapshot) Estimate(event domain.ModelUsageEvent) (Estimate, error) {
 	if err != nil {
 		return Estimate{}, fmt.Errorf("output cost: %w", err)
 	}
-	estimate := Estimate{InputNanos: input, CachedInputNanos: cached, OutputNanos: output, PricingVersion: version}
+	estimate := Estimate{InputNanos: input, CachedInputNanos: cached, OutputNanos: output, CacheWriteNanos: cacheWrite, PricingVersion: version}
 	if input != nil && cached != nil && output != nil {
 		total, err := checkedCostSum(*input, *cached, *output)
 		if err != nil {
@@ -418,38 +487,99 @@ func (s *Snapshot) Estimate(event domain.ModelUsageEvent) (Estimate, error) {
 	return estimate, nil
 }
 
-// estimateInput charges every non-cache-read input token.
-//
+func (p providerSnapshot) longContextRow(rowID string, input *int64) string {
+	if input == nil {
+		return rowID
+	}
+	for _, aboveK := range p.longContext[rowID] {
+		if *input > aboveK*1000 {
+			return LongContextModelID(rowID, aboveK)
+		}
+	}
+	return rowID
+}
+
+// Speed tiers a report groups usage by.
+const (
+	SpeedStandard = "standard"
+	SpeedUnknown  = "unknown"
+)
+
+// SpeedTier names the tier an event was billed at for reports: "standard", a catalog tier (priority, flex, ultrafast, fast), or "unknown".
+func SpeedTier(providerID domain.UsageProviderID, reported string) string {
+	tier, known := catalogServiceTier(providerID, reported)
+	switch {
+	case !known:
+		return SpeedUnknown
+	case tier == "":
+		return SpeedStandard
+	default:
+		return tier
+	}
+}
+
+func catalogServiceTier(providerID domain.UsageProviderID, reported string) (tier string, known bool) {
+	if reported == "" {
+		return "", true
+	}
+	switch providerID {
+	case domain.UsageProviderOpenAI:
+		switch reported {
+		case "default", "standard":
+			return "", true
+		case "priority", "fast":
+			return ServiceTierPriority, true
+		case "flex":
+			return ServiceTierFlex, true
+		case "ultrafast":
+			return ServiceTierUltrafast, true
+		}
+	case domain.UsageProviderAnthropic:
+		switch reported {
+		case "standard":
+			return "", true
+		case "fast":
+			return ServiceTierFast, true
+		}
+	}
+	return "", false
+}
+
 // A catalog without a cache-write rate for the model is not missing data: the
 // provider does not bill writes separately, so the whole uncached bucket is
 // charged at the plain input rate. Only when a distinct write rate exists — as
 // Anthropic publishes, with its own five-minute and one-hour tiers — does the
 // split matter, and only then can an unavailable split leave the cost unknown.
-func estimateInput(event domain.ModelUsageEvent, rates exactRates) (*int64, error) {
+func estimateInput(event domain.ModelUsageEvent, rates exactRates) (input, cacheWrite *int64, err error) {
 	uncached := event.Tokens.UncachedInputTokens
+	split := cacheWriteSplitFor(event)
 	if rates.write == nil && rates.write1H == nil {
-		return chargeOptional(uncached, rates.input)
+		input, err = chargeOptional(uncached, rates.input)
+		if err != nil || input == nil || split.total == nil || uncached == nil || *split.total > *uncached {
+			return input, nil, err
+		}
+		cacheWrite, err = charge(*split.total, rates.input)
+		return input, cacheWrite, err
 	}
 	if uncached == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
-	split := cacheWriteSplitFor(event)
 	if split.total == nil || *split.total > *uncached {
-		return nil, nil
+		return nil, nil, nil
 	}
 	write, err := chargeCacheWrite(split, rates)
 	if err != nil || write == nil {
-		return nil, err
+		return nil, nil, err
 	}
 	fresh, err := charge(*uncached-*split.total, rates.input)
 	if err != nil || fresh == nil {
-		return nil, err
+		return nil, nil, err
 	}
 	total, err := checkedCostSum(*fresh, *write)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return costPointer(total), nil
+	return costPointer(total), write, nil
 }
 
 func chargeCacheWrite(split cacheWriteSplit, rates exactRates) (*int64, error) {
@@ -486,36 +616,43 @@ func cacheWriteSplitFor(event domain.ModelUsageEvent) cacheWriteSplit {
 				Ephemeral5mInputTokens *int64 `json:"ephemeral_5m_input_tokens"`
 				Ephemeral1hInputTokens *int64 `json:"ephemeral_1h_input_tokens"`
 			} `json:"cache_creation"`
+			AOWrite   *int64 `json:"ao_derived_cache_write_input_tokens"`
+			AOWrite1H *int64 `json:"ao_derived_cache_write_1h_input_tokens"`
 		}
 		if err := json.Unmarshal([]byte(event.ProviderUsageJSON), &usage); err != nil {
 			return cacheWriteSplit{}
 		}
 		split := cacheWriteSplit{total: usage.CacheCreationInputTokens}
+		if split.total == nil {
+			split.total = usage.AOWrite
+		}
 		if usage.CacheCreation != nil {
 			split.fiveM = usage.CacheCreation.Ephemeral5mInputTokens
 			split.oneH = usage.CacheCreation.Ephemeral1hInputTokens
+		} else if split.total != nil && usage.AOWrite1H != nil &&
+			*usage.AOWrite1H >= 0 && *usage.AOWrite1H <= *split.total {
+			fiveM := *split.total - *usage.AOWrite1H
+			split.fiveM = &fiveM
+			split.oneH = usage.AOWrite1H
 		}
 		return split
 	case domain.UsageProviderOpenAI:
 		// The neutral counters come from last_token_usage when Codex emits it,
 		// so the write bucket must be read from the same per-event object rather
-		// than from the cumulative totals beside it. When Codex emitted no such
-		// object the parser derived the bucket from those cumulative readings
-		// and stored it under its own key; without that fallback every
-		// write-rated model prices its input as unknown.
+		// than from the cumulative totals beside it.
 		var usage struct {
 			Last *struct {
 				CacheWriteInputTokens *int64 `json:"cache_write_input_tokens"`
 			} `json:"last_token_usage"`
-			Derived *int64 `json:"ao_derived_cache_write_input_tokens"`
+			AOWrite *int64 `json:"ao_derived_cache_write_input_tokens"`
 		}
 		if err := json.Unmarshal([]byte(event.ProviderUsageJSON), &usage); err != nil {
 			return cacheWriteSplit{}
 		}
-		if usage.Last != nil {
+		if usage.Last != nil && usage.Last.CacheWriteInputTokens != nil {
 			return cacheWriteSplit{total: usage.Last.CacheWriteInputTokens}
 		}
-		return cacheWriteSplit{total: usage.Derived}
+		return cacheWriteSplit{total: usage.AOWrite}
 	default:
 		return cacheWriteSplit{}
 	}
@@ -725,17 +862,23 @@ func (m *Manager) Activate(ctx context.Context, candidate *Snapshot) ([]Provider
 	defer release()
 	previous := m.current.Load()
 	activations := changedProviders(previous, candidate)
-	m.current.Store(candidate)
+	next := *candidate
+	next.overrides = previous.overrides
+	m.current.Store(&next)
 	return activations, nil
 }
 
 func validSnapshot(snapshot *Snapshot) bool {
-	if snapshot == nil || len(snapshot.providers) != 3 {
+	if snapshot == nil {
 		return false
 	}
-	for _, providerID := range []string{"anthropic", "openai", "zai"} {
-		provider, ok := snapshot.providers[providerID]
-		if !ok || len(provider.models) == 0 {
+	for _, providerID := range RequiredProviderIDs {
+		if _, ok := snapshot.providers[providerID]; !ok {
+			return false
+		}
+	}
+	for providerID, provider := range snapshot.providers {
+		if len(provider.models) == 0 {
 			return false
 		}
 		prefix := "ao-catalog:" + providerID + ":sha256:"
@@ -748,7 +891,7 @@ func validSnapshot(snapshot *Snapshot) bool {
 
 func changedProviders(previous, next *Snapshot) []ProviderActivation {
 	activations := make([]ProviderActivation, 0, len(next.providers))
-	for _, providerID := range []string{"anthropic", "openai", "zai"} {
+	for _, providerID := range next.ProviderIDs() {
 		version := next.ProviderVersion(providerID)
 		previousVersion := previous.ProviderVersion(providerID)
 		if version != "" && version != previousVersion {

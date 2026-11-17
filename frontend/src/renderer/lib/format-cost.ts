@@ -34,7 +34,7 @@ export function formatEstimatedCost(cost: EstimatedCost | null | undefined): str
 	return formatCostNanos(cost.totalNanos);
 }
 
-export type UnpricedReason = NonNullable<components["schemas"]["UsageTotalsResponse"]["unpricedReason"]>;
+export type UnpricedReason = NonNullable<components["schemas"]["CompactSessionUsageResponse"]["unpricedReason"]>;
 
 /**
  * Translation key for an absent estimate.

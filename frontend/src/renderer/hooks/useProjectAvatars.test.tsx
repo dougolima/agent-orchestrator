@@ -52,7 +52,7 @@ describe("project avatars", () => {
 		vi.stubGlobal("Image", FakeImage);
 		vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({ drawImage: () => undefined } as never);
 		vi.spyOn(HTMLCanvasElement.prototype, "toDataURL").mockReturnValue("data:image/png;base64,avatar");
-		useUiStore.setState({ projectAvatars: true, newSidebarDesign: true, developerMode: false });
+		useUiStore.setState({ projectAvatars: true, developerMode: false });
 		getProject.mockImplementation(async (_path: string, init: { params: { path: { id: string } } }) => {
 			const repo = init.params.path.id === "stone" ? "https://github.com/stone-payments/stone-ai-apps" : "https://github.com/dougolima/second-brain";
 			return { data: { status: "ok", project: { repo } } };
